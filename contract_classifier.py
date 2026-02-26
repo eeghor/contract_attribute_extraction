@@ -1,6 +1,14 @@
 """
 Contract Type Classifier using OpenRouter API
 Sends the same query to multiple small/efficient LLMs and returns structured JSON output.
+
+Changes from previous version:
+- contract_type: inferred ONLY from explicit contract title; "N/A" if no title found.
+- subject_matter: free-text concise summary (no fixed list), 10 words or fewer.
+- regulated_sectors: new field — list of EU-regulated sectors (NIS2/DORA/CER) detected
+  in the contract, or ["N/A"] if none found.
+- types_file / subjects_file CLI args and prompt injection removed accordingly.
+- max_tokens raised to 150 to accommodate the regulated_sectors array.
 """
 
 import os
@@ -22,94 +30,132 @@ if not OPENROUTER_API_KEY:
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ── Models to try ─────────────────────────────────────────────────────────────
-# Selected for strong instruction-following + text/legal parsing at small scale.
-# Ordered roughly by expected legal-text capability (best first).
 MODELS = [
-    # Strong instruction followers with good reasoning at small size
-    "microsoft/phi-4",
-    "mistralai/mistral-nemo",  # 12B, excellent at structured output
-    "google/gemma-2-9b-it",  # Strong at classification tasks
-    "qwen/qwen-2.5-7b-instruct",  # Qwen 2.5 excels at structured JSON
-    "meta-llama/llama-3.2-3b-instruct",  # Llama 3.2 3B — very small but capable
-    "meta-llama/llama-3.1-8b-instruct",  # Llama 3.1 8B — solid all-rounder
+    "mistralai/mistral-nemo",
+    "google/gemma-2-9b-it",
+    "qwen/qwen-2.5-7b-instruct",
+]
+
+# ── EU regulated sectors (NIS2 / DORA / CER) ─────────────────────────────────
+# Injected into the prompt as the closed list for regulated_sectors.
+REGULATED_SECTORS = [
+    "banking",
+    "insurance",
+    "financial markets",
+    "digital infrastructure",
+    "managed ICT services",
+    "energy",
+    "transport",
+    "health",
+    "pharmaceuticals",
+    "water",
+    "public administration",
+    "defence",
+    "space",
+    "food",
+    "waste management",
+    "postal services",
+    "chemicals",
+    "nuclear",
 ]
 
 
 # ── Pydantic output model ─────────────────────────────────────────────────────
 class ContractClassification(BaseModel):
     contract_type: str
-    governing_law: str
     subject_matter: str
+    governing_law: str
     jurisdiction: str
+    regulated_sectors: list[str]
 
-    @field_validator("contract_type", "governing_law", "subject_matter", "jurisdiction")
+    @field_validator("contract_type", "subject_matter", "governing_law", "jurisdiction")
     def strip_whitespace(cls, v: str) -> str:
         if isinstance(v, str):
             return v.strip()
         return v
 
+    @field_validator("regulated_sectors")
+    def strip_sector_whitespace(cls, v: list) -> list:
+        return [s.strip() for s in v if isinstance(s, str)]
+
 
 # ── Prompt builder ────────────────────────────────────────────────────────────
-def build_system_prompt(contract_types: list[str], subject_matters: list[str]) -> str:
-    """
-    Optimisation tricks applied:
-    - Role assignment ("You are an expert lawyer") primes legal reasoning.
-    - Exhaustive contract type list is injected clearly with numbered items.
-    - Strict output format is specified with a concrete example.
-    - Model is told to reason internally but output ONLY JSON (reduces preamble noise).
-    - "N/A" fallback is explicitly described to avoid hallucination of new categories.
-    """
-    types_block = "\n".join(f"  {i+1}. {t}" for i, t in enumerate(contract_types))
-    subject_matter_block = "\n".join(
-        f"  {i+1}. {s}" for i, s in enumerate(subject_matters)
-    )
-    return f"""You are an expert lawyer specialising in contract classification.
+def build_system_prompt(regulated_sectors: list[str]) -> str:
+    sectors_block = ", ".join(f'"{s}"' for s in regulated_sectors)
+    return f"""You are an expert lawyer specialising in contract analysis.
 
-Your task is to read the provided contract text and identify its type, main subject matter, governing law and jurisdiction. 
-The contract types and subject matters you can choose from are strictly limited to the lists provided below.
-Each contract type name is followed by a brief explanation separated by < to assist your decision.
-Each subject matter name is followed by a brief refined definition separated by < to assist your decision.
+Your task is to read the provided contract text and extract five fields, returned as a single JSON object.
 
-ALLOWED CONTRACT TYPES:
-{types_block}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FIELD 1 — contract_type
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Extract the contract type from the EXPLICIT TITLE of the document only. Apply the following priority order:
 
-ALLOWED SUBJECT MATTERS:
-{subject_matter_block}
+1. STANDARD LEGAL INSTRUMENT NAME (preferred): If the title contains or clearly implies a recognised legal instrument name, extract and return that name in English (e.g. "Master Services Agreement", "Non-Disclosure Agreement", "Distribution Agreement"). A standard name is a short, conventional label for a legal instrument type — not a description of what the contract covers.
 
-RULES:
-- You MUST respond with ONLY a valid JSON object. No explanation, no markdown, no preamble.
-- The JSON must have exactly four keys: "contract_type", "subject_matter", "governing_law", and "jurisdiction".
-- The contract type value must be EXACTLY one of the allowed contract types listed above (copy it verbatim), or "N/A" if none match.
-- Decide on contract type by legal mechanism first (MSA, distribution agreement, license agreement, etc.), not by subject matter. 
-- The subject matter must be EXACTLY one of the allowed subject matters listed above (copy it verbatim), or "N/A" if none match.
-- Do not invent new categories. Do not combine types. Do not add commentary.
-- If several contract types are higly relevant, choose the type explicitly stated in the contract title.
-- If several subject matters are higly relevant, choose the type with the more general scope.
-- If the document is addendum or amendment, assign contract type based on the original contract type if possible.
-- The governing law value should be the exact text from the contract translated to English and stripped of articles (e.g. "French law", "laws of State of California", etc.)
-- To identify jurisdiction, scan the text for keywords: "Jurisdiction", "Forum", "Courts of", "Submit to", "Venue".
-- If the document does not match any listed contract type, it's contract type is "N/A".
-- If the document does not match any listed subject matter, it's main subject matter is "N/A".
-- If the document does not explicitly state a governing law, it's governing law is "N/A".
-- If the document does not explicitly state a jurisdiction, it's jurisdiction is "N/A".
-- The jurisdiction value should be the exact text from the contract translated to English and stripped of articles (e.g. "Paris courts")
-- Do NOT confuse Governing Law with Jurisdiction.
+2. DESCRIPTIVE TITLE (fallback): If the title exists but does not contain a standard legal instrument name — for example it describes the subject or arrangement (e.g. "Conditions for Registration with the Good Seat Aggregator", "Terms of Access to the Mobility Platform") — return the full title translated to English verbatim.
+
+3. "N/A": Only if the document has no identifiable title whatsoever.
+
+- Look for the title in the first two pages.
+- Do NOT infer a standard name from the contract body — only from the title itself.
+- Do NOT invent a standard name if the title is purely descriptive.
+- SELF-CHECK before outputting: ask yourself "does the standard name I am about to return appear as words in the document title?" If no, do not use it.
+- A single generic word such as "Agreement" or "Contract" alone does NOT qualify as a standard legal instrument name. It must be a compound name identifying a specific instrument type (e.g. "Distribution Agreement", "Master Services Agreement", "Non-Disclosure Agreement"). A title containing only the word "Agreement" falls through to rule 2 (descriptive title).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FIELD 2 — subject_matter
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Write a free-text summary of the contract's PRIMARY commercial subject in 10 words or fewer.
+- Focus on what is being delivered, exchanged, or governed as the main obligation.
+- Ignore ancillary clauses (confidentiality, data protection, IP boilerplate).
+- Do not use legal mechanism language — describe the commercial activity (e.g. "cloud software subscription for HR management", "distribution of consumer electronics in France").
+Write the subject_matter summary in English regardless of the contract's language.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FIELD 3 — governing_law
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The legal system chosen to interpret the contract.
+- Translate to English and strip definite articles (e.g. "French law", "laws of State of New York").
+- If not explicitly stated in the contract, return "N/A".
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FIELD 4 — jurisdiction
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The court or forum chosen for dispute resolution.
+- Scan for keywords: "jurisdiction", "forum", "courts of", "submit to", "venue", "competent court".
+- Translate to English and strip articles (e.g. "Paris courts", "courts of England and Wales").
+- Do NOT confuse with governing law. A contract may state one without the other.
+- If not explicitly stated, return "N/A".
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FIELD 5 — regulated_sectors
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Identify all EU-regulated sectors (under NIS2, DORA, or CER Directive) that this contract involves.
+- A sector is "involved" only if the contract text contains a CONCRETE SIGNAL: the party operates in that sector, the subject matter is that sector's infrastructure or services, or the contract explicitly references that sector's regulations.
+- Do NOT infer from generic commercial activity alone. A generic IT services contract with no sector-specific party or subject is not "digital infrastructure".
+- Select ONLY from this list: {sectors_block}
+- Return all that apply as a JSON array of strings using the exact values above.
+- If no regulated sector is identifiable, return ["N/A"].
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Respond with ONLY a valid JSON object. No explanation, no markdown, no preamble.
+- The JSON must have exactly five keys: "contract_type", "subject_matter", "governing_law", "jurisdiction", "regulated_sectors".
+- "regulated_sectors" must always be a JSON array, even if it contains only one item or ["N/A"].
+- All values in the JSON output MUST be translated to English. 
 
 EXAMPLE OUTPUT:
-{{"contract_type": "Agency Agreement",
-  "subject_matter": "Workforce & Labor Relations",
+{{"contract_type": "Master Services Agreement",
+  "subject_matter": "IT outsourcing services for payment processing platform",
   "governing_law": "French law",
-  "jurisdiction": "Paris courts"}}
+  "jurisdiction": "Paris courts",
+  "regulated_sectors": ["banking", "digital infrastructure"]}}
 """
 
 
 def build_user_prompt(contract_text: str) -> str:
-    """
-    Optimisation tricks applied:
-    - Contract text is clearly delimited with XML-style tags to prevent prompt injection
-      and help models separate instruction from content.
-    - Reminder of output format at the end (recency bias in attention).
-    """
     return f"""Classify the following contract document.
 
 <contract_text>
@@ -130,7 +176,7 @@ def call_openrouter(
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "Referer": "https://github.com/contract-classifier",  # Optional but good practice
+        "Referer": "https://github.com/contract-classifier",
         "X-Title": "Contract Classifier",
     }
 
@@ -140,11 +186,8 @@ def call_openrouter(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        # Optimisation: low temperature for deterministic classification
         "temperature": 0.0,
-        # Optimisation: limit tokens — a JSON response needs very few
-        "max_tokens": 80,
-        # Ask for JSON output where the API supports it (not all models do via OpenRouter)
+        "max_tokens": 150,  # Raised from 80 to accommodate regulated_sectors array
         "response_format": {"type": "json_object"},
     }
 
@@ -166,49 +209,41 @@ def call_openrouter(
         parsed_json = json.loads(raw_content)
         result = ContractClassification(**parsed_json)
 
+        sectors_display = ", ".join(result.regulated_sectors)
         return {
             "model": model,
             "contract_type": result.contract_type,
             "subject_matter": result.subject_matter,
             "governing_law": result.governing_law,
             "jurisdiction": result.jurisdiction,
+            "regulated_sectors": result.regulated_sectors,
             "raw_response": raw_content,
             "error": None,
         }
 
     except httpx.HTTPStatusError as e:
-        return {
-            "model": model,
-            "contract_type": None,
-            "raw_response": None,
-            "subject_matter": None,
-            "governing_law": None,
-            "jurisdiction": None,
-            "error": f"HTTP {e.response.status_code}: {e.response.text}",
-        }
+        return _error_result(model, f"HTTP {e.response.status_code}: {e.response.text}")
     except json.JSONDecodeError as e:
-        return {
-            "model": model,
-            "contract_type": None,
-            "raw_response": raw_content if "raw_content" in locals() else None,
-            "subject_matter": None,
-            "governing_law": None,
-            "jurisdiction": None,
-            "error": f"JSON parse error: {e}",
-        }
+        raw = raw_content if "raw_content" in locals() else None
+        return _error_result(model, f"JSON parse error: {e}", raw)
     except Exception as e:
-        return {
-            "model": model,
-            "contract_type": None,
-            "raw_response": None,
-            "subject_matter": None,
-            "governing_law": None,
-            "jurisdiction": None,
-            "error": str(e),
-        }
+        return _error_result(model, str(e))
 
 
-# ── File loaders ──────────────────────────────────────────────────────────────
+def _error_result(model: str, error: str, raw_response: Optional[str] = None) -> dict:
+    return {
+        "model": model,
+        "contract_type": None,
+        "subject_matter": None,
+        "governing_law": None,
+        "jurisdiction": None,
+        "regulated_sectors": None,
+        "raw_response": raw_response,
+        "error": error,
+    }
+
+
+# ── File loader ───────────────────────────────────────────────────────────────
 def load_contract_text(filepath: str) -> str:
     path = Path(filepath)
     if not path.exists():
@@ -216,29 +251,9 @@ def load_contract_text(filepath: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def load_contract_types(filepath: str) -> list[str]:
-    """
-    Expects a plain text file with one contract type per line.
-    Blank lines and lines starting with # are ignored.
-    """
-    path = Path(filepath)
-    if not path.exists():
-        raise FileNotFoundError(f"Contract types file not found: {filepath}")
-    lines = path.read_text(encoding="utf-8").splitlines()
-    cleaned = []
-    for line in lines:
-        s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        cleaned.append(s)
-    return cleaned
-
-
 # ── Main runner ───────────────────────────────────────────────────────────────
 def classify_contract(
     contract_file: str,
-    types_file: str,
-    subjects_file: Optional[str] = None,
     models: Optional[list[str]] = None,
     delay_between_calls: float = 1.0,
 ) -> list[dict]:
@@ -247,21 +262,17 @@ def classify_contract(
 
     Args:
         contract_file:        Path to the contract text file.
-        types_file:           Path to the contract types list (one per line).
         models:               List of OpenRouter model IDs. Defaults to MODELS.
         delay_between_calls:  Seconds to wait between API calls (rate limit safety).
     """
     contract_text = load_contract_text(contract_file)
-    contract_types = load_contract_types(types_file)
-    subject_matters = load_contract_types(subjects_file) if subjects_file else []
     selected_models = models or MODELS
 
     print(f"📄 Contract file   : {contract_file}")
-    print(f"📋 Types file      : {types_file} ({len(contract_types)} types loaded)")
     print(f"🤖 Models to query : {len(selected_models)}")
     print("-" * 60)
 
-    system_prompt = build_system_prompt(contract_types, subject_matters)
+    system_prompt = build_system_prompt(REGULATED_SECTORS)
     user_prompt = build_user_prompt(contract_text)
 
     results = []
@@ -273,8 +284,13 @@ def classify_contract(
         if result["error"]:
             print(f"❌ ERROR: {result['error']}")
         else:
+            sectors = ", ".join(result["regulated_sectors"])
             print(
-                f"✅ → {result['contract_type']} → {result.get('subject_matter')} → {result['governing_law']} → {result.get('jurisdiction')}"
+                f"✅ → {result['contract_type']}"
+                f" | {result['subject_matter']}"
+                f" | {result['governing_law']}"
+                f" | {result['jurisdiction']}"
+                f" | [{sectors}]"
             )
 
         if i < len(selected_models):
@@ -294,16 +310,6 @@ if __name__ == "__main__":
         "--contract", required=True, help="Path to the contract text file"
     )
     parser.add_argument(
-        "--types",
-        required=True,
-        help="Path to the contract types list file (one per line)",
-    )
-    parser.add_argument(
-        "--subjects",
-        required=False,
-        help="Path to the subject matters list file (one per line)",
-    )
-    parser.add_argument(
         "--output",
         default="results.json",
         help="Path to save JSON results (default: results.json)",
@@ -318,8 +324,6 @@ if __name__ == "__main__":
 
     results = classify_contract(
         contract_file=args.contract,
-        types_file=args.types,
-        subjects_file=args.subjects,
         delay_between_calls=args.delay,
     )
 
