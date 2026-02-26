@@ -40,8 +40,9 @@ class ContractClassification(BaseModel):
     contract_type: str
     governing_law: str
     subject_matter: str
+    jurisdiction: str
 
-    @field_validator("contract_type", "governing_law", "subject_matter")
+    @field_validator("contract_type", "governing_law", "subject_matter", "jurisdiction")
     def strip_whitespace(cls, v: str) -> str:
         if isinstance(v, str):
             return v.strip()
@@ -64,7 +65,7 @@ def build_system_prompt(contract_types: list[str], subject_matters: list[str]) -
     )
     return f"""You are an expert lawyer specialising in contract classification.
 
-Your task is to read the provided contract text and identify its type, main subject matter and governing law. 
+Your task is to read the provided contract text and identify its type, main subject matter, governing law and jurisdiction. 
 The contract types and subject matters you can choose from are strictly limited to the lists provided below.
 Each contract type name is followed by a brief explanation separated by < to assist your decision.
 Each subject matter name is followed by a brief refined definition separated by < to assist your decision.
@@ -77,22 +78,28 @@ ALLOWED SUBJECT MATTERS:
 
 RULES:
 - You MUST respond with ONLY a valid JSON object. No explanation, no markdown, no preamble.
-- The JSON must have exactly three keys: "contract_type", "subject_matter", and "governing_law".
+- The JSON must have exactly four keys: "contract_type", "subject_matter", "governing_law", and "jurisdiction".
 - The contract type value must be EXACTLY one of the allowed contract types listed above (copy it verbatim), or "N/A" if none match.
-- The main subject matter must be EXACTLY one of the allowed contract types listed above (copy it verbatim), or "N/A" if none match.
+- Decide on contract type by legal mechanism first (MSA, distribution agreement, license agreement, etc.), not by subject matter. 
+- The subject matter must be EXACTLY one of the allowed subject matters listed above (copy it verbatim), or "N/A" if none match.
 - Do not invent new categories. Do not combine types. Do not add commentary.
-- If several contract types are higly relevant, choose the type with the more general scope (e.g. "Service Agreement" over "IT Service Agreement").
+- If several contract types are higly relevant, choose the type explicitly stated in the contract title.
 - If several subject matters are higly relevant, choose the type with the more general scope.
 - If the document is addendum or amendment, assign contract type based on the original contract type if possible.
 - The governing law value should be the exact text from the contract translated to English and stripped of articles (e.g. "French law", "laws of State of California", etc.)
+- To identify jurisdiction, scan the text for keywords: "Jurisdiction", "Forum", "Courts of", "Submit to", "Venue".
 - If the document does not match any listed contract type, it's contract type is "N/A".
 - If the document does not match any listed subject matter, it's main subject matter is "N/A".
 - If the document does not explicitly state a governing law, it's governing law is "N/A".
+- If the document does not explicitly state a jurisdiction, it's jurisdiction is "N/A".
+- The jurisdiction value should be the exact text from the contract translated to English and stripped of articles (e.g. "Paris courts")
+- Do NOT confuse Governing Law with Jurisdiction.
 
 EXAMPLE OUTPUT:
 {{"contract_type": "Agency Agreement",
   "subject_matter": "Workforce & Labor Relations",
-  "governing_law": "French law"}}
+  "governing_law": "French law",
+  "jurisdiction": "Paris courts"}}
 """
 
 
@@ -164,6 +171,7 @@ def call_openrouter(
             "contract_type": result.contract_type,
             "subject_matter": result.subject_matter,
             "governing_law": result.governing_law,
+            "jurisdiction": result.jurisdiction,
             "raw_response": raw_content,
             "error": None,
         }
@@ -175,6 +183,7 @@ def call_openrouter(
             "raw_response": None,
             "subject_matter": None,
             "governing_law": None,
+            "jurisdiction": None,
             "error": f"HTTP {e.response.status_code}: {e.response.text}",
         }
     except json.JSONDecodeError as e:
@@ -184,6 +193,7 @@ def call_openrouter(
             "raw_response": raw_content if "raw_content" in locals() else None,
             "subject_matter": None,
             "governing_law": None,
+            "jurisdiction": None,
             "error": f"JSON parse error: {e}",
         }
     except Exception as e:
@@ -193,6 +203,7 @@ def call_openrouter(
             "raw_response": None,
             "subject_matter": None,
             "governing_law": None,
+            "jurisdiction": None,
             "error": str(e),
         }
 
@@ -263,7 +274,7 @@ def classify_contract(
             print(f"❌ ERROR: {result['error']}")
         else:
             print(
-                f"✅ → {result['contract_type']} → {result.get('subject_matter')} → {result['governing_law']}"
+                f"✅ → {result['contract_type']} → {result.get('subject_matter')} → {result['governing_law']} → {result.get('jurisdiction')}"
             )
 
         if i < len(selected_models):
