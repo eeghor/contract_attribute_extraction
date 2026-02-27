@@ -32,8 +32,8 @@ OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 # ── Models to try ─────────────────────────────────────────────────────────────
 MODELS = [
     "mistralai/mistral-nemo",
-    "google/gemma-2-9b-it",
-    "qwen/qwen-2.5-7b-instruct",
+    "qwen/qwen3.5-flash-02-23",
+    "qwen/qwen3.5-35b-a3b",
 ]
 
 # ── EU regulated sectors (NIS2 / DORA / CER) ─────────────────────────────────
@@ -102,6 +102,7 @@ Extract the contract type from the EXPLICIT TITLE of the document only. Apply th
 - Do NOT invent a standard name if the title is purely descriptive.
 - SELF-CHECK before outputting: ask yourself "does the standard name I am about to return appear as words in the document title?" If no, do not use it.
 - A single generic word such as "Agreement" or "Contract" alone does NOT qualify as a standard legal instrument name. It must be a compound name identifying a specific instrument type (e.g. "Distribution Agreement", "Master Services Agreement", "Non-Disclosure Agreement"). A title containing only the word "Agreement" falls through to rule 2 (descriptive title).
+- Use generic descriptors instead of people or company names (e.g. "an insurance company" or "a contractor").
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FIELD 2 — subject_matter
@@ -110,6 +111,7 @@ Write a free-text summary of the contract's PRIMARY commercial subject in 10 wor
 - Focus on what is being delivered, exchanged, or governed as the main obligation.
 - Ignore ancillary clauses (confidentiality, data protection, IP boilerplate).
 - Do not use legal mechanism language — describe the commercial activity (e.g. "cloud software subscription for HR management", "distribution of consumer electronics in France").
+- Use generic descriptors instead of people or company names (e.g. "an insurance company" or "a contractor").
 Write the subject_matter summary in English regardless of the contract's language.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
