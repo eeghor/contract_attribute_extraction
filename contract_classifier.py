@@ -26,27 +26,32 @@ OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Ordered roughly by expected legal-text capability (best first).
 MODELS = [
     # Strong instruction followers with good reasoning at small size
-    "microsoft/phi-4",
-    "mistralai/mistral-nemo",  # 12B, excellent at structured output
-    "google/gemma-2-9b-it",  # Strong at classification tasks
-    "qwen/qwen-2.5-7b-instruct",  # Qwen 2.5 excels at structured JSON
-    "meta-llama/llama-3.2-3b-instruct",  # Llama 3.2 3B — very small but capable
-    "meta-llama/llama-3.1-8b-instruct",  # Llama 3.1 8B — solid all-rounder
+    # "qwen/qwen3.5-122b-a10b",
+    "qwen/qwen3.5-flash-02-23",
 ]
 
 
 # ── Pydantic output model ─────────────────────────────────────────────────────
 class ContractClassification(BaseModel):
-    contract_type: str
-    governing_law: str
+    contract_type_primary: str
+    contract_type_secondary: list[str]
     subject_matter: str
+    governing_law: str
     jurisdiction: str
 
-    @field_validator("contract_type", "governing_law", "subject_matter", "jurisdiction")
+    @field_validator(
+        "contract_type_primary", "subject_matter", "governing_law", "jurisdiction"
+    )
     def strip_whitespace(cls, v: str) -> str:
         if isinstance(v, str):
             return v.strip()
         return v
+
+    @field_validator("contract_type_secondary")
+    def ensure_list_of_str(cls, v: list) -> list[str]:
+        if v is None:
+            return []
+        return [str(x).strip() for x in v]
 
 
 # ── Prompt builder ────────────────────────────────────────────────────────────
@@ -59,44 +64,71 @@ def build_system_prompt(contract_types: list[str], subject_matters: list[str]) -
     - Model is told to reason internally but output ONLY JSON (reduces preamble noise).
     - "N/A" fallback is explicitly described to avoid hallucination of new categories.
     """
-    types_block = "\n".join(f"  {i+1}. {t}" for i, t in enumerate(contract_types))
+
     subject_matter_block = "\n".join(
         f"  {i+1}. {s}" for i, s in enumerate(subject_matters)
     )
     return f"""You are an expert lawyer specialising in contract classification.
 
 Your task is to read the provided contract text and identify its type, main subject matter, governing law and jurisdiction. 
-The contract types and subject matters you can choose from are strictly limited to the lists provided below.
-Each contract type name is followed by a brief explanation separated by < to assist your decision.
+The contract types you identify must follow the taxonomy below. The subject matters you can choose from are strictly limited to the list provided below.
 Each subject matter name is followed by a brief refined definition separated by < to assist your decision.
 
-ALLOWED CONTRACT TYPES:
-{types_block}
+DECISION HIERARCHY (The "Winner" Rule)
+If a contract appears to fit multiple Primary Types, follow this priority order:
+
+AMENDMENT (If it modifies a previous doc, it is always an Amendment)
+REAL_ESTATE (Physical property trumps service)
+EMPLOYMENT (Direct hiring trumps general services)
+IP_LICENSING (SaaS/Software rights trump general services)
+SERVICES_AGREEMENT (The default for B2B labor/consulting)
+TRANSACTIONAL (Smallest unit of work/payment)
+NDAs (Only if no money or labor is mentioned)
+
+CONTRACT TYPE TAXONOMY
+
+1. PRIMARY TYPES (Pick Exactly One)
+
+EMPLOYMENT: Agreements for internal roles (Full-time, Part-time, Executive). Rule: Must involve a payroll/salary relationship.
+SERVICES_AGREEMENT: Framework agreements for B2B labor (MSAs, Consulting, Professional Services). Rule: Focuses on the "how" and "who" of the relationship.
+TRANSACTIONAL: One-off execution documents (Purchase Orders, SOWs, Order Forms). Rule: Focuses on a specific deliverable or payment.
+NDAs: Standalone confidentiality agreements. Rule: If there is a price or a job title, it is NOT a standalone NDA.
+IP_LICENSING: Rights to use existing assets (SaaS Terms, Software Licenses, Trademark/Patent transfers).
+CORPORATE_GOVERNANCE: Internal company rules (Bylaws, Board Resolutions, Shareholder agreements).
+REAL_ESTATE: Physical space (Leases, deeds, property management).
+AMENDMENT: Modifies an existing contract (Addendums, Extension notices, Change orders).
+
+2. SECONDARY TYPES (Pick All That Apply)
+
+CONFIDENTIALITY: Includes non-disclosure or secrecy clauses.
+IP_ASSIGNMENT: Clauses transferring ownership of "Work Product" or inventions.
+NON_COMPETE: Includes restrictive covenants or non-solicitation.
+DPA: Specific Data Processing or Privacy (GDPR/CCPA/HIPAA) terms.
+INDEMNIFICATION: Significant liability shifting or "hold harmless" clauses.
 
 ALLOWED SUBJECT MATTERS:
 {subject_matter_block}
 
 RULES:
 - You MUST respond with ONLY a valid JSON object. No explanation, no markdown, no preamble.
-- The JSON must have exactly four keys: "contract_type", "subject_matter", "governing_law", and "jurisdiction".
-- The contract type value must be EXACTLY one of the allowed contract types listed above (copy it verbatim), or "N/A" if none match.
-- Decide on contract type by legal mechanism first (MSA, distribution agreement, license agreement, etc.), not by subject matter. 
+- The JSON must have exactly five keys: "contract_type_primary", "contract_type_secondary", "subject_matter", "governing_law", and "jurisdiction".
+- "contract_type_primary" must be EXACTLY one of the PRIMARY TYPES listed above, or "N/A" if none match. Identify the "North Star" — if it's an Employment contract with an NDA, the Primary is EMPLOYMENT.
+- "contract_type_secondary" must be a JSON array containing zero or more SECONDARY TYPES listed above (e.g. ["CONFIDENTIALITY", "DPA"]). Use an empty array [] if none apply.
 - The subject matter must be EXACTLY one of the allowed subject matters listed above (copy it verbatim), or "N/A" if none match.
 - Do not invent new categories. Do not combine types. Do not add commentary.
-- If several contract types are higly relevant, choose the type explicitly stated in the contract title.
-- If several subject matters are higly relevant, choose the type with the more general scope.
-- If the document is addendum or amendment, assign contract type based on the original contract type if possible.
+- If several subject matters are highly relevant, choose the one with the more general scope.
 - The governing law value should be the exact text from the contract translated to English and stripped of articles (e.g. "French law", "laws of State of California", etc.)
 - To identify jurisdiction, scan the text for keywords: "Jurisdiction", "Forum", "Courts of", "Submit to", "Venue".
-- If the document does not match any listed contract type, it's contract type is "N/A".
+- If the document does not match any listed primary contract type, set "contract_type_primary" to "N/A".
 - If the document does not match any listed subject matter, it's main subject matter is "N/A".
 - If the document does not explicitly state a governing law, it's governing law is "N/A".
 - If the document does not explicitly state a jurisdiction, it's jurisdiction is "N/A".
-- The jurisdiction value should be the exact text from the contract translated to English and stripped of articles (e.g. "Paris courts")
+- The jurisdiction value should be the exact text from the contract translated to English and stripped of articles (e.g. "Paris courts").
 - Do NOT confuse Governing Law with Jurisdiction.
 
 EXAMPLE OUTPUT:
-{{"contract_type": "Agency Agreement",
+{{"contract_type_primary": "EMPLOYMENT",
+  "contract_type_secondary": ["CONFIDENTIALITY", "NON_COMPETE"],
   "subject_matter": "Workforce & Labor Relations",
   "governing_law": "French law",
   "jurisdiction": "Paris courts"}}
@@ -143,7 +175,7 @@ def call_openrouter(
         # Optimisation: low temperature for deterministic classification
         "temperature": 0.0,
         # Optimisation: limit tokens — a JSON response needs very few
-        "max_tokens": 80,
+        "max_tokens": 100,
         # Ask for JSON output where the API supports it (not all models do via OpenRouter)
         "response_format": {"type": "json_object"},
     }
@@ -168,7 +200,8 @@ def call_openrouter(
 
         return {
             "model": model,
-            "contract_type": result.contract_type,
+            "contract_type_primary": result.contract_type_primary,
+            "contract_type_secondary": result.contract_type_secondary,
             "subject_matter": result.subject_matter,
             "governing_law": result.governing_law,
             "jurisdiction": result.jurisdiction,
@@ -179,7 +212,8 @@ def call_openrouter(
     except httpx.HTTPStatusError as e:
         return {
             "model": model,
-            "contract_type": None,
+            "contract_type_primary": None,
+            "contract_type_secondary": [],
             "raw_response": None,
             "subject_matter": None,
             "governing_law": None,
@@ -189,7 +223,8 @@ def call_openrouter(
     except json.JSONDecodeError as e:
         return {
             "model": model,
-            "contract_type": None,
+            "contract_type_primary": None,
+            "contract_type_secondary": [],
             "raw_response": raw_content if "raw_content" in locals() else None,
             "subject_matter": None,
             "governing_law": None,
@@ -199,7 +234,8 @@ def call_openrouter(
     except Exception as e:
         return {
             "model": model,
-            "contract_type": None,
+            "contract_type_primary": None,
+            "contract_type_secondary": [],
             "raw_response": None,
             "subject_matter": None,
             "governing_law": None,
@@ -237,7 +273,7 @@ def load_contract_types(filepath: str) -> list[str]:
 # ── Main runner ───────────────────────────────────────────────────────────────
 def classify_contract(
     contract_file: str,
-    types_file: str,
+    types_file: Optional[str] = None,
     subjects_file: Optional[str] = None,
     models: Optional[list[str]] = None,
     delay_between_calls: float = 1.0,
@@ -252,12 +288,15 @@ def classify_contract(
         delay_between_calls:  Seconds to wait between API calls (rate limit safety).
     """
     contract_text = load_contract_text(contract_file)
-    contract_types = load_contract_types(types_file)
+    contract_types = load_contract_types(types_file) if types_file else []
     subject_matters = load_contract_types(subjects_file) if subjects_file else []
     selected_models = models or MODELS
 
     print(f"📄 Contract file   : {contract_file}")
-    print(f"📋 Types file      : {types_file} ({len(contract_types)} types loaded)")
+    if types_file:
+        print(f"📋 Types file      : {types_file} ({len(contract_types)} types loaded)")
+    else:
+        print("📋 Types file      : (none supplied — using built-in taxonomy)")
     print(f"🤖 Models to query : {len(selected_models)}")
     print("-" * 60)
 
@@ -273,8 +312,10 @@ def classify_contract(
         if result["error"]:
             print(f"❌ ERROR: {result['error']}")
         else:
+            primary = result.get("contract_type_primary")
+            secondary = result.get("contract_type_secondary")
             print(
-                f"✅ → {result['contract_type']} → {result.get('subject_matter')} → {result['governing_law']} → {result.get('jurisdiction')}"
+                f"✅ → {primary} → {secondary} → {result.get('subject_matter')} → {result.get('governing_law')} → {result.get('jurisdiction')}"
             )
 
         if i < len(selected_models):
@@ -295,8 +336,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--types",
-        required=True,
-        help="Path to the contract types list file (one per line)",
+        required=False,
+        help="Path to the contract types list file (one per line). If omitted the built-in taxonomy is used",
     )
     parser.add_argument(
         "--subjects",
