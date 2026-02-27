@@ -31,7 +31,6 @@ OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ── Models to try ─────────────────────────────────────────────────────────────
 MODELS = [
-    "mistralai/mistral-nemo",
     "qwen/qwen3.5-flash-02-23",
     "qwen/qwen3.5-35b-a3b",
 ]
