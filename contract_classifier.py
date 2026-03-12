@@ -121,7 +121,16 @@ RULES:
 - "contract_type_secondary": A JSON array of labels from the SECONDARY TYPES list. Empty array [] if none.
 - "subject_matter": Must be verbatim from the ALLOWED SUBJECT MATTERS list (text before the colon).
 - "governing_law": The exact law mentioned (e.g., "English law"). If not stated, "N/A".
-- "jurisdiction": The specific court/city/venue mentioned (e.g., "Courts of London"). If not stated, "N/A".
+- "jurisdiction": Extract the court venue and format it strictly as [CITY]_[ISO2_COUNTRY_CODE]_[COURT_TYPE] (all uppercase for city and country code). Rules:
+    - CITY: the city name in UPPERCASE. If no city is mentioned (e.g., "Courts of France"), use NULL.
+    - ISO2_COUNTRY_CODE: the 2-letter ISO 3166-1 alpha-2 country code in UPPERCASE (e.g., FR, DE, GB, IT, NL).
+    - COURT_TYPE: must be exactly one of: General, Commercial, High, State, Federal, Chancery, International Commercial Court, Tribunal, Small Claims, Arbitration, IP, National.
+      * If the text says "courts of [City]" with no further specificity: use General.
+      * If the text says "Competent courts": use General.
+      * If no city is mentioned but a country is (e.g., "Courts of France", "Italian courts"): use NULL for city and National for type.
+      * Otherwise match the court type from context (e.g., "Commercial Court of Paris" → PARIS_FR_Commercial, "High Court of London" → LONDON_GB_High).
+    - If no jurisdiction is stated at all: use "N/A".
+    - Examples: PARIS_FR_Commercial, LONDON_GB_High, NULL_IT_National, AMSTERDAM_NL_General.
 - "contract_language": The natural language the contract is written in (e.g., "English", "French", "German"). Detect from the document text itself.
 
 EXAMPLE OUTPUT:
@@ -130,7 +139,7 @@ EXAMPLE OUTPUT:
   "contract_type_secondary": ["DATA_PRIVACY", "FINANCIAL_COMMITMENT"],
   "subject_matter": "Information Technology & Digital Systems",
   "governing_law": "Dutch law",
-  "jurisdiction": "Amsterdam courts",
+  "jurisdiction": "AMSTERDAM_NL_General",
   "contract_language": "English"
 }}
 """
