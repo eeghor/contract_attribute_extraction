@@ -38,9 +38,14 @@ class ContractClassification(BaseModel):
     subject_matter: str
     governing_law: str
     jurisdiction: str
+    contract_language: str
 
     @field_validator(
-        "contract_type_primary", "subject_matter", "governing_law", "jurisdiction"
+        "contract_type_primary",
+        "subject_matter",
+        "governing_law",
+        "jurisdiction",
+        "contract_language",
     )
     def strip_whitespace(cls, v: str) -> str:
         if isinstance(v, str):
@@ -117,6 +122,7 @@ RULES:
 - "subject_matter": Must be verbatim from the ALLOWED SUBJECT MATTERS list (text before the colon).
 - "governing_law": The exact law mentioned (e.g., "English law"). If not stated, "N/A".
 - "jurisdiction": The specific court/city/venue mentioned (e.g., "Courts of London"). If not stated, "N/A".
+- "contract_language": The natural language the contract is written in (e.g., "English", "French", "German"). Detect from the document text itself.
 
 EXAMPLE OUTPUT:
 {{
@@ -124,7 +130,8 @@ EXAMPLE OUTPUT:
   "contract_type_secondary": ["DATA_PRIVACY", "FINANCIAL_COMMITMENT"],
   "subject_matter": "Information Technology & Digital Systems",
   "governing_law": "Dutch law",
-  "jurisdiction": "Amsterdam courts"
+  "jurisdiction": "Amsterdam courts",
+  "contract_language": "English"
 }}
 """
 
@@ -169,7 +176,7 @@ def call_openrouter(
         # Optimisation: low temperature for deterministic classification
         "temperature": 0.0,
         # Optimisation: limit tokens — a JSON response needs very few
-        "max_tokens": 100,
+        "max_tokens": 150,
         # Ask for JSON output where the API supports it (not all models do via OpenRouter)
         "response_format": {"type": "json_object"},
     }
@@ -199,6 +206,7 @@ def call_openrouter(
             "subject_matter": result.subject_matter,
             "governing_law": result.governing_law,
             "jurisdiction": result.jurisdiction,
+            "contract_language": result.contract_language,
             "raw_response": raw_content,
             "error": None,
         }
@@ -212,6 +220,7 @@ def call_openrouter(
             "subject_matter": None,
             "governing_law": None,
             "jurisdiction": None,
+            "contract_language": None,
             "error": f"HTTP {e.response.status_code}: {e.response.text}",
         }
     except json.JSONDecodeError as e:
@@ -223,6 +232,7 @@ def call_openrouter(
             "subject_matter": None,
             "governing_law": None,
             "jurisdiction": None,
+            "contract_language": None,
             "error": f"JSON parse error: {e}",
         }
     except Exception as e:
@@ -234,6 +244,7 @@ def call_openrouter(
             "subject_matter": None,
             "governing_law": None,
             "jurisdiction": None,
+            "contract_language": None,
             "error": str(e),
         }
 
@@ -282,7 +293,7 @@ def classify_contract(
             primary = result.get("contract_type_primary")
             secondary = result.get("contract_type_secondary")
             print(
-                f"✅ → {primary} → {secondary} → {result.get('subject_matter')} → {result.get('governing_law')} → {result.get('jurisdiction')}"
+                f"✅ → {primary} → {secondary} → {result.get('subject_matter')} → {result.get('governing_law')} → {result.get('jurisdiction')} → {result.get('contract_language')}"
             )
 
         if i < len(selected_models):
