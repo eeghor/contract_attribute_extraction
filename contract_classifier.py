@@ -37,10 +37,14 @@ class ContractClassification(BaseModel):
     contract_type_secondary: list[str]
     subject_matter: str
     governing_law: str
-    jurisdiction: str
+    jurisdiction: list[str]
+    contract_language: str
 
     @field_validator(
-        "contract_type_primary", "subject_matter", "governing_law", "jurisdiction"
+        "contract_type_primary",
+        "subject_matter",
+        "governing_law",
+        "contract_language",
     )
     def strip_whitespace(cls, v: str) -> str:
         if isinstance(v, str):
@@ -52,6 +56,41 @@ class ContractClassification(BaseModel):
         if v is None:
             return []
         return [str(x).strip() for x in v]
+
+    @field_validator("jurisdiction")
+    def validate_jurisdiction(cls, v) -> list[str]:
+        """
+        Accepts either:
+          - a JSON array of exactly 3 strings: [CITY, ISO2_COUNTRY_CODE, COURT_TYPE]
+          - the legacy underscore string "CITY_CC_TYPE" (backwards-compat / model slip)
+          - the string "N/A"
+        Always returns a list[str] with all entries uppercased and stripped.
+        """
+        if v is None:
+            return ["N/A"]
+
+        # Model returned the old underscore format or plain "N/A" as a string
+        if isinstance(v, str):
+            v = v.strip()
+            if v.upper() == "N/A":
+                return ["N/A"]
+            parts = v.split("_")
+            if len(parts) == 3:
+                return [p.strip().upper() for p in parts]
+            raise ValueError(
+                f"jurisdiction string must be 'N/A' or 'CITY_ISO2_COURT_TYPE', got: {v!r}"
+            )
+
+        if isinstance(v, list):
+            if len(v) == 1 and str(v[0]).strip().upper() == "N/A":
+                return ["N/A"]
+            if len(v) != 3:
+                raise ValueError(
+                    f"jurisdiction array must have exactly 3 elements [CITY, ISO2, COURT_TYPE], got {len(v)}: {v}"
+                )
+            return [str(entry).strip().upper() for entry in v]
+
+        raise ValueError(f"jurisdiction must be a list or string, got: {type(v)}")
 
 
 # ── Prompt builder ────────────────────────────────────────────────────────────
@@ -116,7 +155,17 @@ RULES:
 - "contract_type_secondary": A JSON array of labels from the SECONDARY TYPES list. Empty array [] if none.
 - "subject_matter": Must be verbatim from the ALLOWED SUBJECT MATTERS list (text before the colon).
 - "governing_law": The exact law mentioned (e.g., "English law"). If not stated, "N/A".
-- "jurisdiction": The specific court/city/venue mentioned (e.g., "Courts of London"). If not stated, "N/A".
+- "jurisdiction": Extract the court venue and return it as a JSON array with exactly 3 UPPERCASE string entries: ["CITY", "ISO2_COUNTRY_CODE", "COURT_TYPE"]. Rules:
+    - CITY: the city name in UPPERCASE. If no city is mentioned (e.g., "Courts of France"), use "NULL".
+    - ISO2_COUNTRY_CODE: the 2-letter ISO 3166-1 alpha-2 country code in UPPERCASE (e.g., "FR", "DE", "GB", "IT", "NL").
+    - COURT_TYPE: must be exactly one of (in UPPERCASE): "GENERAL", "COMMERCIAL", "HIGH", "STATE", "FEDERAL", "CHANCERY", "INTERNATIONAL COMMERCIAL COURT", "TRIBUNAL", "SMALL CLAIMS", "ARBITRATION", "IP", "NATIONAL".
+      * If the text says "courts of [City]" with no further specificity: use "GENERAL".
+      * If the text says "Competent courts": use "GENERAL".
+      * If no city is mentioned but a country is (e.g., "Courts of France", "Italian courts"): use "NULL" for city and "NATIONAL" for type.
+      * Otherwise match the court type from context (e.g., "Commercial Court of Paris" → ["PARIS", "FR", "COMMERCIAL"]).
+    - If no jurisdiction is stated at all: use ["N/A"].
+    - Examples: ["PARIS", "FR", "COMMERCIAL"], ["LONDON", "GB", "HIGH"], ["NULL", "IT", "NATIONAL"], ["AMSTERDAM", "NL", "GENERAL"].
+- "contract_language": The natural language the contract is written in (e.g., "English", "French", "German"). Detect from the document text itself.
 
 EXAMPLE OUTPUT:
 {{
@@ -124,7 +173,8 @@ EXAMPLE OUTPUT:
   "contract_type_secondary": ["DATA_PRIVACY", "FINANCIAL_COMMITMENT"],
   "subject_matter": "Information Technology & Digital Systems",
   "governing_law": "Dutch law",
-  "jurisdiction": "Amsterdam courts"
+  "jurisdiction": ["AMSTERDAM", "NL", "GENERAL"],
+  "contract_language": "English"
 }}
 """
 
@@ -169,7 +219,7 @@ def call_openrouter(
         # Optimisation: low temperature for deterministic classification
         "temperature": 0.0,
         # Optimisation: limit tokens — a JSON response needs very few
-        "max_tokens": 100,
+        "max_tokens": 150,
         # Ask for JSON output where the API supports it (not all models do via OpenRouter)
         "response_format": {"type": "json_object"},
     }
@@ -199,6 +249,7 @@ def call_openrouter(
             "subject_matter": result.subject_matter,
             "governing_law": result.governing_law,
             "jurisdiction": result.jurisdiction,
+            "contract_language": result.contract_language,
             "raw_response": raw_content,
             "error": None,
         }
@@ -212,6 +263,7 @@ def call_openrouter(
             "subject_matter": None,
             "governing_law": None,
             "jurisdiction": None,
+            "contract_language": None,
             "error": f"HTTP {e.response.status_code}: {e.response.text}",
         }
     except json.JSONDecodeError as e:
@@ -223,6 +275,7 @@ def call_openrouter(
             "subject_matter": None,
             "governing_law": None,
             "jurisdiction": None,
+            "contract_language": None,
             "error": f"JSON parse error: {e}",
         }
     except Exception as e:
@@ -234,6 +287,7 @@ def call_openrouter(
             "subject_matter": None,
             "governing_law": None,
             "jurisdiction": None,
+            "contract_language": None,
             "error": str(e),
         }
 
@@ -282,7 +336,7 @@ def classify_contract(
             primary = result.get("contract_type_primary")
             secondary = result.get("contract_type_secondary")
             print(
-                f"✅ → {primary} → {secondary} → {result.get('subject_matter')} → {result.get('governing_law')} → {result.get('jurisdiction')}"
+                f"✅ → {primary} → {secondary} → {result.get('subject_matter')} → {result.get('governing_law')} → {result.get('jurisdiction')} → {result.get('contract_language')}"
             )
 
         if i < len(selected_models):
