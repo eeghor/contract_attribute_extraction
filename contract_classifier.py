@@ -1,6 +1,80 @@
 """
-Contract Type Classifier using OpenRouter API
-Sends the same query to multiple small/efficient LLMs and returns structured JSON output.
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                       CONTRACT CLASSIFIER — OVERVIEW                        ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+WHAT THIS TOOL DOES
+───────────────────
+This script reads a contract document (plain text or Markdown exported from OCS)
+and automatically extracts the following structured metadata from it:
+
+  • Contract type       – What kind of agreement is this? (e.g. Employment,
+                          SaaS licence, Shareholders' Agreement, NDA...)
+  • Secondary tags      – What notable clauses does it contain? (e.g. GDPR
+                          data-processing obligations, non-compete, auto-renewal...)
+  • Subject matter      – What is the commercial topic of the contract?
+                          (e.g. IT & Digital Systems, Real Estate, Finance...)
+  • Governing law       – Which country's law applies? (e.g. "English law")
+  • Jurisdiction        – Which court has authority to settle disputes?
+                          Stored as three separate fields ready for SQL filtering:
+                            - jurisdiction_city        (e.g. "PARIS")
+                            - jurisdiction_country     (e.g. "FR")
+                            - jurisdiction_court_type  (e.g. "COMMERCIAL")
+  • Contract language   – The natural language the document is written in.
+
+HOW IT WORKS (step by step)
+────────────────────────────
+  1. LOAD   – The contract file is read from disk.
+  2. CLEAN  – Markdown formatting artefacts (headings, bold, rules) are stripped
+              so they do not confuse the AI model.
+  3. PROMPT – A detailed instruction set (the "system prompt") tells the AI
+              exactly what to look for and how to label each field, including
+              tie-breaker rules for ambiguous cases.
+  4. QUERY  – The cleaned contract text is sent to one or more AI language
+              models via the OpenRouter API (a gateway to multiple AI providers).
+              Temperature is set to 0 so the model responds deterministically.
+  5. PARSE  – The AI response is expected to be a strict JSON object. The code
+              validates every field (types, allowed values, internal consistency)
+              using Pydantic — a data-validation library. Malformed or partial
+              responses are caught and surfaced as errors rather than silently
+              producing wrong data.
+  6. SAVE   – Results are written to a JSON file for downstream processing
+              (e.g. import into a SQL database or review dashboard).
+
+AI MODEL USED
+─────────────
+By default, Qwen 3.5 Flash is used via OpenRouter. This is a fast, cost-efficient
+model well suited to structured extraction tasks. The MODELS list at the top of
+the file can be extended to query multiple models and compare their outputs.
+
+CONFIGURATION
+─────────────
+The script expects a single environment variable:
+  OPENROUTER_API_KEY  – Your OpenRouter API key, typically stored in a .env file.
+
+USAGE (command line)
+────────────────────
+  python contract_classifier.py --contract path/to/contract.txt
+  python contract_classifier.py --contract path/to/contract.md --output results.json
+
+OUTPUT FORMAT (one record per model queried)
+────────────────────────────────────────────
+  {
+    "model":                  "qwen/qwen3.5-flash-02-23",
+    "contract_type_primary":  "IP_LICENSING_AND_TECH",
+    "contract_type_secondary": ["DATA_PRIVACY", "FINANCIAL_COMMITMENT"],
+    "subject_matter":         "Information Technology & Digital Systems",
+    "governing_law":          "Dutch law",
+    "jurisdiction_city":      "AMSTERDAM",
+    "jurisdiction_country":   "NL",
+    "jurisdiction_court_type": "GENERAL",
+    "contract_language":      "English",
+    "raw_response":           "<raw JSON string from the model>",
+    "error":                  null
+  }
+
+  If extraction fails for any reason, all classification fields are null and
+  the "error" field explains what went wrong.
 """
 
 import os
@@ -25,17 +99,71 @@ if not OPENROUTER_API_KEY:
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # ── Models to try ─────────────────────────────────────────────────────────────
-# Selected for strong instruction-following + text/legal parsing at small scale.
+# The AI models that will be queried. Each model in this list processes the same
+# contract independently, allowing you to compare outputs or build consensus logic.
+# Models are identified by their OpenRouter model ID (provider/model-name format).
 # Ordered roughly by expected legal-text capability (best first).
+# To query multiple models, uncomment additional entries or add new ones.
 MODELS = [
-    # Strong instruction followers with good reasoning at small size
-    # "qwen/qwen3.5-122b-a10b",
-    "qwen/qwen3.5-flash-02-23",
+    # "qwen/qwen3.5-122b-a10b",  # Larger, slower, higher-quality alternative
+    "qwen/qwen3.5-flash-02-23",  # Default: fast, cost-efficient, good at structured extraction
 ]
 
 
 # ── Pydantic output model ─────────────────────────────────────────────────────
 class ContractClassification(BaseModel):
+    """
+    The structured data record produced for each contract.
+
+    This class defines the exact shape of the AI's output and enforces data
+    quality rules before any result is accepted. Think of it as a form with
+    strict validation: if the AI fills in a field incorrectly (wrong format,
+    inconsistent values, missing required entry), the record is rejected and
+    an error is returned instead of silently storing bad data.
+
+    Fields
+    ──────
+    contract_type_primary    : The single best-fit contract category from a
+                               fixed 9-item taxonomy (e.g. SERVICES, INDIVIDUAL_LABOUR).
+                               A strict hierarchy resolves ambiguity — the highest-
+                               ranked matching type always wins.
+
+    contract_type_secondary  : Zero or more tags describing notable clause types
+                               present in the contract (e.g. DATA_PRIVACY,
+                               RESTRICTIVE_COVENANTS). Defaults to an empty list
+                               if the AI returns null or omits the field.
+
+    subject_matter           : The commercial topic of the contract, chosen verbatim
+                               from a fixed 14-item list (e.g. "Real Estate & Facilities").
+
+    governing_law            : The legal system that governs the contract
+                               (e.g. "English law", "French law"). Stored as None
+                               if not stated.
+
+    jurisdiction_city        : The city where disputes must be brought
+                               (e.g. "PARIS"). None if only a country is named
+                               or if no jurisdiction clause exists.
+
+    jurisdiction_country     : ISO 3166-1 alpha-2 country code of the court
+                               (e.g. "FR", "GB"). None only if no jurisdiction
+                               clause exists at all.
+
+    jurisdiction_court_type  : The type of court specified (e.g. "COMMERCIAL",
+                               "HIGH", "GENERAL"). None only if no jurisdiction
+                               clause exists at all.
+
+    contract_language        : The natural language the contract is written in,
+                               detected from the document text (e.g. "English").
+
+    Validation rules enforced automatically
+    ───────────────────────────────────────
+    - All string fields are stripped of leading/trailing whitespace.
+    - Sentinel strings "NULL" and "N/A" returned by the AI are converted to
+      Python None so downstream SQL storage receives proper NULL values.
+    - jurisdiction_country and jurisdiction_court_type must both be present
+      or both be absent — a partial jurisdiction entry is rejected.
+    - jurisdiction_city cannot be set without a jurisdiction_country.
+    """
     contract_type_primary: str
     contract_type_secondary: Annotated[list[str], BeforeValidator(lambda v: [] if v is None else v)] = Field(default_factory=list)
     subject_matter: str
@@ -51,6 +179,7 @@ class ContractClassification(BaseModel):
         "contract_language",
     )
     def strip_whitespace(cls, v: str) -> str:
+        """Remove accidental leading/trailing whitespace from core string fields."""
         if isinstance(v, str):
             return v.strip()
         return v
@@ -101,7 +230,18 @@ class ContractClassification(BaseModel):
 # ── Prompt builder ────────────────────────────────────────────────────────────
 def build_system_prompt() -> str:
     """
-    Returns the built-in system prompt for contract classification. No file-based taxonomy.
+    Build the instruction set sent to the AI model before it sees any contract text.
+
+    The system prompt is the core of the classifier. It defines:
+      - The contract type taxonomy and strict priority hierarchy.
+      - The allowed subject matter categories.
+      - Tie-breaker rules for genuinely ambiguous contracts
+        (e.g. a SaaS agreement where a company also provides implementation services).
+      - Precise output field definitions including allowed values, NULL semantics,
+        and worked examples covering every jurisdiction pattern.
+
+    The prompt is written once and reused for every model and every contract in a
+    given run, so any change here affects all results immediately.
     """
     return """You are an expert lawyer specialising in contract classification. Your task is to extract metadata from the provided contract text into a structured JSON format.
 
@@ -211,17 +351,24 @@ EXAMPLE OUTPUT (no jurisdiction stated):
 
 def clean_contract_text(text: str) -> str:
     """
-    Normalise contract text arriving from OCS, which may be plain text or Markdown.
+    Normalise contract text exported from OCS before sending it to the AI model.
 
-    OCS markdown artefacts that can confuse the classifier:
-      - Heading markers (# / ## / ###) add no semantic value and inflate tokens.
-      - Horizontal rules (--- / ***) are purely visual.
-      - Bold/italic markers (** / * / __ / _) around clause headings are noise.
-      - Redundant blank lines (3+) waste context window space.
-      - Non-breaking spaces and other Unicode whitespace variants can break
-        tokenisation and regex matching inside the model.
+    OCS can export contracts as plain text or as Markdown (a lightweight text
+    format that uses symbols like # for headings and ** for bold). While Markdown
+    is useful for human reading, its formatting symbols are noise from the AI's
+    perspective — they consume context space without adding legal meaning.
 
-    Plain-text OCS exports are kept as-is apart from whitespace normalisation.
+    Artefacts removed
+    ─────────────────
+    - Heading markers (# / ## / ###)      — kept as plain text, symbol removed.
+    - Horizontal rules  (--- / ***)       — visual dividers, removed entirely.
+    - Bold/italic markers (** / * / __ / _) — formatting only, markers removed.
+    - Redundant blank lines (3 or more)   — collapsed to a single blank line.
+    - Unicode whitespace variants          — non-breaking spaces, zero-width spaces,
+                                            and similar invisible characters that
+                                            can silently break text matching.
+
+    Plain-text exports are returned unchanged except for whitespace normalisation.
     """
     # Normalise Unicode whitespace (NBSP, thin space, zero-width space, etc.)
     text = re.sub(u"[\u00a0\u200b\u200c\u200d\u2009\u202f\ufeff]", " ", text)
@@ -239,10 +386,17 @@ def clean_contract_text(text: str) -> str:
 
 def build_user_prompt(contract_text: str) -> str:
     """
-    Optimisation tricks applied:
-    - Contract text is clearly delimited with XML-style tags to prevent prompt injection
-      and help models separate instruction from content.
-    - Reminder of output format at the end (recency bias in attention).
+    Prepare the contract text as the user-side message sent to the AI model.
+
+    The contract is first cleaned (see clean_contract_text), then wrapped in
+    XML-style <contract_text> tags. These tags serve two purposes:
+      1. They create a clear boundary between the AI's instructions and the
+         contract content, preventing the contract text from being mistaken
+         for additional instructions (a risk known as "prompt injection").
+      2. They help the model focus its attention on the right section of input.
+
+    A short reminder to respond only with JSON is appended at the end, exploiting
+    the model's tendency to give extra weight to the most recent instructions.
     """
     contract_text = clean_contract_text(contract_text)
     return f"""Classify the following contract document.
@@ -261,7 +415,43 @@ def call_openrouter(
     user_prompt: str,
     timeout: int = 60,
 ) -> dict:
-    """Call OpenRouter and return parsed result."""
+    """
+    Send a classification request to a single AI model via OpenRouter and return
+    a validated, normalised result dictionary.
+
+    OpenRouter is an API gateway that provides access to many AI models through
+    a single, unified interface. This function handles the full request lifecycle:
+
+      1. Sends the system prompt (instructions) and user prompt (contract text)
+         to the specified model.
+      2. Strips any Markdown code fences the model may have wrapped around its
+         JSON output, despite being instructed not to.
+      3. Parses the raw JSON response.
+      4. Validates and normalises every field via the ContractClassification model.
+      5. Returns a flat dictionary ready for serialisation or database insertion.
+
+    Temperature is set to 0.0 so the model's output is as deterministic as
+    possible — the same contract should produce the same result on each run.
+    max_tokens is capped at 300, which is sufficient for a full JSON response
+    with all fields populated, while preventing runaway generation.
+
+    On any failure (network error, malformed JSON, validation error), all
+    classification fields are set to None and the "error" key explains what
+    went wrong, so the caller can log and continue rather than crashing.
+
+    Args
+    ────
+    model          : OpenRouter model ID (e.g. "qwen/qwen3.5-flash-02-23").
+    system_prompt  : The classification instructions built by build_system_prompt().
+    user_prompt    : The contract text wrapped by build_user_prompt().
+    timeout        : Maximum seconds to wait for an API response (default: 60).
+
+    Returns
+    ───────
+    A dict with keys: model, contract_type_primary, contract_type_secondary,
+    subject_matter, governing_law, jurisdiction_city, jurisdiction_country,
+    jurisdiction_court_type, contract_language, raw_response, error.
+    """
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -358,6 +548,14 @@ def call_openrouter(
 
 # ── File loaders ──────────────────────────────────────────────────────────────
 def load_contract_text(filepath: str) -> str:
+    """
+    Read a contract file from disk and return its full text content.
+
+    Accepts plain text (.txt) or Markdown (.md) files exported from OCS.
+    The file must be UTF-8 encoded, which is the standard for OCS exports.
+    Raises a clear FileNotFoundError if the path does not exist, rather than
+    letting a cryptic OS error propagate to the caller.
+    """
     path = Path(filepath)
     if not path.exists():
         raise FileNotFoundError(f"Contract file not found: {filepath}")
@@ -371,12 +569,29 @@ def classify_contract(
     delay_between_calls: float = 1.0,
 ) -> list[dict]:
     """
-    Run classification across all models and return a list of results.
+    Classify a single contract file using one or more AI models and return all results.
 
-    Args:
-        contract_file:        Path to the contract text file.
-        models:               List of OpenRouter model IDs. Defaults to MODELS.
-        delay_between_calls:  Seconds to wait between API calls (rate limit safety).
+    This is the main entry point for programmatic use of the classifier. It
+    orchestrates the full pipeline: loading the file, building prompts, querying
+    each model in sequence, and collecting results.
+
+    A configurable delay between API calls prevents hitting OpenRouter's rate
+    limits when querying multiple models back-to-back.
+
+    Args
+    ────
+    contract_file        : Path to the contract text file (.txt or .md from OCS).
+    models               : List of OpenRouter model IDs to query. If not provided,
+                           defaults to the MODELS list defined at the top of this file.
+    delay_between_calls  : Seconds to pause between successive API calls.
+                           Increase this if you encounter rate-limit errors (default: 1.0).
+
+    Returns
+    ───────
+    A list of result dictionaries, one per model queried. Each dict contains all
+    extracted classification fields plus a "raw_response" and "error" key.
+    Failed model calls are included in the list with error details rather than
+    being silently dropped, so you always get one record per model per contract.
     """
     contract_text = load_contract_text(contract_file)
     selected_models = models or MODELS
