@@ -21,26 +21,30 @@ and automatically extracts the following structured metadata from it:
                             - jurisdiction_country     (e.g. "FR")
                             - jurisdiction_court_type  (e.g. "COMMERCIAL")
   • Contract language   – The natural language the document is written in.
+  • Regulated sectors   – Which EU-regulated sectors (NIS2 / DORA / CER / AI Act)
+                          are touched by this contract, if any. Extracted by a
+                          dedicated second AI call so it does not interfere with
+                          the type classification.
 
 HOW IT WORKS (step by step)
 ────────────────────────────
-  1. LOAD   – The contract file is read from disk.
-  2. CLEAN  – Markdown formatting artefacts (headings, bold, rules) are stripped
-              so they do not confuse the AI model.
-  3. PROMPT – A detailed instruction set (the "system prompt") tells the AI
-              exactly what to look for and how to label each field, including
-              tie-breaker rules for ambiguous cases.
-  4. QUERY  – The cleaned contract text is sent to one or more AI language
-              models via the OpenRouter API (a gateway to multiple AI providers).
-              Temperature is set to 0 so the model responds deterministically.
-  5. PARSE  – The AI response is expected to be a strict JSON object. The code
-              validates every field (types, allowed values, internal consistency)
-              using Pydantic — a data-validation library. Malformed or partial
-              responses are caught and surfaced as errors rather than silently
-              producing wrong data.
-  6. SAVE   – Results are written to a JSON file for downstream processing
-              (e.g. import into a SQL database or review dashboard).
-
+  1. LOAD    – The contract file is read from disk.
+  2. CLEAN   – Markdown formatting artefacts (headings, bold, rules) are stripped
+               so they do not confuse the AI model.
+  3. PROMPT  – Two separate instruction sets are prepared:
+               (a) Type classifier: what kind of contract is this, what does it
+                   cover, which law and court apply, what language is it in?
+               (b) Sector classifier: does this contract touch any EU-regulated
+                   sector under NIS2, DORA, CER, or the AI Act?
+  4. QUERY   – For each AI model, both prompts are sent sequentially (chained):
+               call (a) completes first, then call (b) runs on the same cleaned
+               text. Temperature is set to 0 for deterministic results.
+  5. PARSE   – Each response is validated against its own Pydantic model.
+               Malformed or partial responses surface as errors rather than
+               silently producing wrong data.
+  6. MERGE   – The two result dicts are merged into one flat record per model.
+  7. SAVE    – Results are written to a JSON file for downstream processing
+               (e.g. import into a SQL database or review dashboard).
 AI MODEL USED
 ─────────────
 By default, Qwen 3.5 Flash is used via OpenRouter. This is a fast, cost-efficient
@@ -69,12 +73,24 @@ OUTPUT FORMAT (one record per model queried)
     "jurisdiction_country":   "NL",
     "jurisdiction_court_type": "GENERAL",
     "contract_language":      "English",
-    "raw_response":           "<raw JSON string from the model>",
-    "error":                  null
+        "regulated_sectors":       ["Digital Infrastructure", "Banking & Financial Markets"],
+    "raw_response":            "<raw JSON string from the type classifier>",
+    "sector_raw_response":     "<raw JSON string from the sector classifier>",
+    "error":                   null,
+    "elapsed_type_s":          2.41,
+    "elapsed_sector_s":        1.87,
+    "elapsed_total_s":         4.28,
+    "sector_error":            null
   }
 
-  If extraction fails for any reason, all classification fields are null and
-  the "error" field explains what went wrong.
+  The pipeline makes two sequential AI calls per model per contract:
+    1. Contract type classifier   -> fills all fields except regulated_sectors.
+    2. Regulated sector classifier -> fills regulated_sectors using the EU
+       NIS2 / DORA / CER / AI Act framework.
+
+  If either call fails, its fields are null/[] and the corresponding error
+  key ("error" or "sector_error") explains what went wrong. A sector failure
+  does not suppress the type classification result, and vice versa.
 """
 
 import os
@@ -162,7 +178,11 @@ class ContractClassification(BaseModel):
       Python None so downstream SQL storage receives proper NULL values.
     - jurisdiction_country and jurisdiction_court_type must both be present
       or both be absent — a partial jurisdiction entry is rejected.
-    - jurisdiction_city cannot be set without a jurisdiction_country.
+    - If jurisdiction_city is set but jurisdiction_country is None (model
+      failed to infer the country from the city), jurisdiction_city is
+      silently set to None so the record remains coherent. The prompt
+      instructs the model to always infer country from city, so this
+      fallback should be rare in practice.
     """
     contract_type_primary: str
     contract_type_secondary: Annotated[list[str], BeforeValidator(lambda v: [] if v is None else v)] = Field(default_factory=list)
@@ -201,21 +221,28 @@ class ContractClassification(BaseModel):
           - If all three are None → fine (no jurisdiction stated).
           - If jurisdiction_country or jurisdiction_court_type is populated,
             the other must also be populated (city is allowed to be None).
-          - jurisdiction_city must not be set without country + court_type.
+          - If jurisdiction_city is set but jurisdiction_country is None,
+            the model failed to infer the country from the city name.
+            Rather than rejecting the whole record, jurisdiction_city is
+            silently set to None so the country/court_type pair remains
+            coherent. The prompt instructs the model to always infer
+            country from city, so this path should be rare in practice.
         """
         city = self.jurisdiction_city
         country = self.jurisdiction_country
         court_type = self.jurisdiction_court_type
+
+        # Model failed to infer country from the city name: degrade
+        # gracefully by nulling out the city rather than rejecting the record.
+        if city is not None and country is None:
+            self.jurisdiction_city = None
+            city = None
+
         populated = [f for f in (country, court_type) if f is not None]
         if len(populated) not in (0, 2):
             raise ValueError(
                 f"jurisdiction_country and jurisdiction_court_type must both be set or both be NULL. "
                 f"Got: country={country!r}, court_type={court_type!r}"
-            )
-        if city is not None and country is None:
-            raise ValueError(
-                f"jurisdiction_city is set to {city!r} but jurisdiction_country is NULL — "
-                "a city cannot be provided without a country."
             )
         return self
 
@@ -294,7 +321,7 @@ RULES:
 - "subject_matter": Must be verbatim from the ALLOWED SUBJECT MATTERS list (text before the colon).
 - "governing_law": The exact law mentioned (e.g., "English law"). If not stated, use NULL.
 - "jurisdiction_city": The city of the court venue in UPPERCASE (e.g., "PARIS", "LONDON"). Use NULL if no city is mentioned (e.g. "Courts of France") or if no jurisdiction is stated at all.
-- "jurisdiction_country": The 2-letter ISO 3166-1 alpha-2 country code in UPPERCASE (e.g., "FR", "DE", "GB", "IT", "NL"). Extract the country even when no city is mentioned (e.g. "Courts of France" → "FR", "Italian courts" → "IT"). Use NULL only if no jurisdiction is stated at all.
+- "jurisdiction_country": The 2-letter ISO 3166-1 alpha-2 country code in UPPERCASE (e.g., "FR", "DE", "GB", "IT", "NL"). ALWAYS infer the country — even when the country is not explicitly named — from either (a) an explicit country name, or (b) the city named in the jurisdiction clause (e.g., "Courts of Paris" → "FR", "Milan courts" → "IT", "courts of Amsterdam" → "NL", "London courts" → "GB"). Extract the country even when no city is mentioned (e.g. "Courts of France" → "FR", "Italian courts" → "IT"). Use NULL only if no jurisdiction is stated at all and no country can be inferred from any named city or region.
 - "jurisdiction_court_type": Must be exactly one of (in UPPERCASE): "GENERAL", "COMMERCIAL", "HIGH", "STATE", "FEDERAL", "CHANCERY", "INTERNATIONAL COMMERCIAL COURT", "TRIBUNAL", "SMALL CLAIMS", "ARBITRATION", "IP", "NATIONAL". Rules:
       * If the text says "courts of [City]" with no further specificity: use "GENERAL".
       * If the text says "Competent courts": use "GENERAL".
@@ -401,6 +428,237 @@ def build_user_prompt(contract_text: str) -> str:
 Respond with ONLY the JSON object as specified. No other text."""
 
 
+
+# ── Allowed regulated sector labels ──────────────────────────────────────────
+# Canonical labels matching the NIS2 / DORA / CER / AI Act taxonomy.
+# The sector validator uses this set to reject any label the model invents.
+VALID_SECTORS: frozenset = frozenset({
+    "Banking & Financial Markets",
+    "Insurance & Pensions",
+    "Digital Infrastructure",
+    "Managed ICT & Security Services (MSP/MSSP)",
+    "Energy",
+    "Transport",
+    "Health & Life Sciences",
+    "Manufacturing (Critical Goods)",
+    "Water & Wastewater",
+    "Public Administration & Defence",
+    "Space & Satellite Infrastructure",
+    "Digital Providers (Platforms)",
+    "Food, Waste & Postal Services",
+    "Chemical & Nuclear",
+    "Research Organizations",
+    "High-Risk AI",  # AI Act horizontal layer — co-exists with any primary sector
+})
+
+
+# ── Pydantic sector model ─────────────────────────────────────────────────────
+class SectorClassification(BaseModel):
+    """
+    The structured output of the regulated-sector classifier.
+
+    A single contract may touch multiple regulated sectors simultaneously
+    (e.g. a cloud hosting agreement for a bank is both Digital Infrastructure
+    and Banking & Financial Markets). All applicable sectors are returned.
+
+    Fields
+    ──────
+    regulated_sectors : A list of sector labels from the EU NIS2 / DORA / CER /
+                        AI Act taxonomy. Each label must exactly match one of the
+                        entries in VALID_SECTORS. null / missing / ["N/A"] are all
+                        normalised to [] to keep downstream SQL clean.
+
+    Validation rules enforced automatically
+    ───────────────────────────────────────
+    - null / missing field → empty list (same pattern as contract_type_secondary).
+    - ["N/A"] sentinel → empty list (no regulated sector identified).
+    - Any label not in VALID_SECTORS is rejected, surfacing a clear validation
+      error rather than silently storing a hallucinated sector name.
+    - Each label is stripped of whitespace before matching.
+    """
+    regulated_sectors: Annotated[
+        list[str],
+        BeforeValidator(lambda v: [] if v is None else v),
+    ] = Field(default_factory=list)
+
+    @field_validator("regulated_sectors")
+    @classmethod
+    def validate_sector_labels(cls, v: list) -> list:
+        """
+        Strip whitespace from each label, normalise ["N/A"] to [],
+        and reject any label not in the canonical VALID_SECTORS set.
+        """
+        cleaned = [str(s).strip() for s in v]
+        if cleaned == ["N/A"]:
+            return []
+        invalid = [s for s in cleaned if s not in VALID_SECTORS]
+        if invalid:
+            raise ValueError(
+                f"Unrecognised sector label(s): {invalid}. "
+                f"Must be one of: {sorted(VALID_SECTORS)}"
+            )
+        return cleaned
+
+
+def build_sector_prompt() -> str:
+    """
+    Build the system prompt for the regulated-sector classifier.
+
+    This prompt is entirely separate from the contract type classifier and
+    encodes the full EU NIS2 / DORA / CER / AI Act sector taxonomy, four
+    critical cross-cutting classification rules, and per-sector signal lists.
+
+    Key rules embedded
+    ──────────────────
+    - ACTIVITY OVER ENTITY: Classify by what the contract's subject matter
+      does, not what industry label the signing party carries.
+    - NO GROUP PRIVILEGE: Intra-group IT/Cloud/Security services are still
+      classified as Digital Infrastructure or Managed ICT.
+    - LEX SPECIALIS: Banking/Finance signals invoke DORA as the primary
+      regulatory anchor, taking precedence over general NIS2 rules.
+    - AI HORIZONTAL LAYER: AI used for recruitment, education, or biometric
+      identification triggers "High-Risk AI" regardless of primary sector.
+    """
+    return """You are a regulatory compliance expert specialising in EU critical infrastructure law (NIS2, DORA, CER Directive, AI Act). Your task is to identify which regulated sectors are touched by the provided contract.
+
+CLASSIFICATION LOGIC (CRITICAL — apply before assigning any sector)
+1. ACTIVITY OVER ENTITY: Classify based on what the contract's subject matter involves, not the brand of the signing party. If a retail company is building a power plant, classify as Energy.
+2. NO GROUP PRIVILEGE: Legal entities providing IT/Cloud/Security services to their own corporate group are classified as Digital Infrastructure or Managed ICT — not exempt.
+3. LEX SPECIALIS: If Banking/Finance signals are present, DORA is the primary regulatory anchor and takes precedence over general NIS2 rules.
+4. AI HORIZONTAL LAYER: Any contract involving AI for recruitment, education, or biometric identification must include "High-Risk AI" regardless of the primary sector.
+
+REGULATED SECTORS AND THEIR SIGNALS
+
+Banking & Financial Markets: credit institutions, investment firms, payment service providers, financial market infrastructures. Signals: banking licenses, payment processing, clearing, settlement, trading platforms, credit facilities, banks, insurers, asset managers, financial market operators.
+Insurance & Pensions: insurance undertakings, reinsurance, occupational pension funds (Solvency II / IORP II). Signals: insurance underwriting, policy administration, actuarial systems, claims processing, licensed insurers, pension fund administrators.
+Digital Infrastructure: internet exchange points (IXPs), DNS providers, TLD registries, cloud computing providers, data centres, CDN providers. Signals: data centre operations, cloud hosting (IaaS/PaaS), DNS/TLD management, internet exchange, CDN services.
+Managed ICT & Security Services (MSP/MSSP): managed service providers and managed security service providers. Signals: outsourced IT management, managed SOC, remote infrastructure monitoring, third-party cybersecurity administration.
+Energy: electricity, gas, oil, hydrogen, district heating — transmission, distribution, supply, generation. Signals: power generation, grid operation, gas transmission, oil pipelines, energy trading, smart metering, TSOs, DSOs, licensed energy suppliers.
+Transport: air, rail, maritime, road transport operators and infrastructure managers. Signals: airport operations, air traffic management, railway network management, port operations, vessel traffic services, road traffic management systems.
+Health & Life Sciences: hospitals, healthcare networks, labs. Signals: patient data systems (EHR), clinical operations, licensed healthcare providers.
+Manufacturing (Critical Goods): medical devices (MDR/IVDR), chemicals, computers/electronics, electrical equipment, machinery, motor vehicles. Signals: NACE codes C26-C30, medical device hardware, pharmaceutical manufacturing, automotive supply chains, industrial machinery production.
+Water & Wastewater: drinking water suppliers, wastewater treatment operators. Signals: water treatment, distribution network management, SCADA systems for water infrastructure, public water utilities.
+Public Administration & Defence: central and regional government bodies, entities processing sensitive government information. Signals: government agencies, classified information (EUCI), defence procurement, military systems.
+Space & Satellite Infrastructure: ground-based infrastructure supporting space-based services. Signals: satellite operations, ground station management, space-based positioning (PNT), earth observation infrastructure.
+Digital Providers (Platforms): online marketplaces, search engines, social networking platforms. Signals: user-generated content hosting, e-commerce platform operations, search algorithms, digital advertising marketplaces.
+Food, Waste & Postal Services: large-scale food production/processing, hazardous waste management, universal postal service providers. Signals: food safety certification (large scale), municipal waste systems, universal service obligation (USO) postal networks.
+Chemical & Nuclear: manufacturers of hazardous chemicals, nuclear facility operators. Signals: REACH-regulated substances, chemical plant operations, nuclear power generation, radioactive material handling.
+Research Organizations: research activities related to any of the above sectors. Signals: scientific research grants in energy/health/space, laboratory services for critical entities.
+High-Risk AI: AI systems used for recruitment/HR screening, educational assessment, or biometric identification/categorisation. Regulatory anchor: EU AI Act Annex III. Apply in addition to any primary sector — it is a horizontal tag, not a standalone replacement.
+
+RULES:
+- Respond ONLY with a valid JSON object. No preamble or markdown.
+- "regulated_sectors": A JSON array of applicable sector labels, using EXACTLY the names listed above.
+- Return [] if no regulated sector applies.
+- Apply ALL sectors that are triggered — a single contract may touch several.
+- Do NOT infer a sector from the party's general industry if the contract's subject matter does not involve that sector's regulated activities.
+
+EXAMPLE OUTPUT (cloud hosting agreement for a bank):
+{{
+  "regulated_sectors": ["Digital Infrastructure", "Banking & Financial Markets"]
+}}
+
+EXAMPLE OUTPUT (standard marketing services agreement):
+{{
+  "regulated_sectors": []
+}}
+
+EXAMPLE OUTPUT (AI recruitment tool for a hospital):
+{{
+  "regulated_sectors": ["Health & Life Sciences", "High-Risk AI"]
+}}
+"""
+
+
+def call_openrouter_sector(
+    model: str,
+    sector_system_prompt: str,
+    user_prompt: str,
+    timeout: int = 60,
+) -> dict:
+    """
+    Send a regulated-sector classification request to a single AI model and
+    return a validated result dictionary.
+
+    Structurally mirrors call_openrouter() but uses the sector system prompt
+    and validates against SectorClassification. Keeping the two functions
+    separate ensures a sector failure never suppresses the type result.
+
+    max_tokens is 150 (vs 300 for the type call) because the sector response
+    contains only one field; even all 16 sector labels fit within this limit.
+
+    Args
+    ────
+    model               : OpenRouter model ID.
+    sector_system_prompt: The sector instructions built by build_sector_prompt().
+    user_prompt         : The same contract text wrapped by build_user_prompt(),
+                          reused from the type classification call.
+    timeout             : Maximum seconds to wait for the API response (default: 60).
+
+    Returns
+    ───────
+    A dict with keys: regulated_sectors, sector_raw_response, sector_error.
+    """
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "Referer": "https://github.com/contract-classifier",
+        "X-Title": "Contract Classifier",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": sector_system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 150,
+        "response_format": {"type": "json_object"},
+    }
+
+    t0 = time.perf_counter()
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(OPENROUTER_API_URL, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+        raw_content = data["choices"][0]["message"]["content"].strip()
+        raw_content = re.sub(r"^```(?:json)?\s*", "", raw_content, flags=re.IGNORECASE)
+        raw_content = re.sub(r"\s*```$", "", raw_content).strip()
+
+        parsed_json = json.loads(raw_content)
+        result = SectorClassification(**parsed_json)
+
+        return {
+            "regulated_sectors": result.regulated_sectors,
+            "sector_raw_response": raw_content,
+            "elapsed_sector_s": round(time.perf_counter() - t0, 2),
+            "sector_error": None,
+        }
+
+    except httpx.HTTPStatusError as e:
+        return {
+            "regulated_sectors": [],
+            "sector_raw_response": None,
+            "elapsed_sector_s": round(time.perf_counter() - t0, 2),
+            "sector_error": f"HTTP {e.response.status_code}: {e.response.text}",
+        }
+    except json.JSONDecodeError as e:
+        return {
+            "regulated_sectors": [],
+            "sector_raw_response": raw_content if "raw_content" in locals() else None,
+            "elapsed_sector_s": round(time.perf_counter() - t0, 2),
+            "sector_error": f"JSON parse error: {e}",
+        }
+    except Exception as e:
+        return {
+            "regulated_sectors": [],
+            "sector_raw_response": None,
+            "elapsed_sector_s": round(time.perf_counter() - t0, 2),
+            "sector_error": str(e),
+        }
+
 # ── API call ──────────────────────────────────────────────────────────────────
 def call_openrouter(
     model: str,
@@ -466,6 +724,7 @@ def call_openrouter(
         "response_format": {"type": "json_object"},
     }
 
+    t0 = time.perf_counter()
     try:
         with httpx.Client(timeout=timeout) as client:
             response = client.post(OPENROUTER_API_URL, headers=headers, json=payload)
@@ -492,6 +751,7 @@ def call_openrouter(
             "jurisdiction_court_type": result.jurisdiction_court_type,
             "contract_language": result.contract_language,
             "raw_response": raw_content,
+            "elapsed_type_s": round(time.perf_counter() - t0, 2),
             "error": None,
         }
 
@@ -507,6 +767,7 @@ def call_openrouter(
             "jurisdiction_country": None,
             "jurisdiction_court_type": None,
             "contract_language": None,
+            "elapsed_type_s": round(time.perf_counter() - t0, 2),
             "error": f"HTTP {e.response.status_code}: {e.response.text}",
         }
     except json.JSONDecodeError as e:
@@ -521,6 +782,7 @@ def call_openrouter(
             "jurisdiction_country": None,
             "jurisdiction_court_type": None,
             "contract_language": None,
+            "elapsed_type_s": round(time.perf_counter() - t0, 2),
             "error": f"JSON parse error: {e}",
         }
     except Exception as e:
@@ -535,6 +797,7 @@ def call_openrouter(
             "jurisdiction_country": None,
             "jurisdiction_court_type": None,
             "contract_language": None,
+            "elapsed_type_s": round(time.perf_counter() - t0, 2),
             "error": str(e),
         }
 
@@ -564,27 +827,28 @@ def classify_contract(
     """
     Classify a single contract file using one or more AI models and return all results.
 
-    This is the main entry point for programmatic use of the classifier. It
-    orchestrates the full pipeline: loading the file, building prompts, querying
-    each model in sequence, and collecting results.
+    Orchestrates the full chained pipeline for each model:
+      1. Load and clean the contract text (once, shared across both calls).
+      2. Run the contract type classifier  (call 1).
+      3. Run the regulated sector classifier on the same text (call 2).
+      4. Merge both results into one flat record.
 
-    A configurable delay between API calls prevents hitting OpenRouter's rate
-    limits when querying multiple models back-to-back.
+    A failure in either call is recorded in its own error key and does not
+    suppress the other call's results.
 
     Args
     ────
     contract_file        : Path to the contract text file (.txt or .md from OCS).
-    models               : List of OpenRouter model IDs to query. If not provided,
-                           defaults to the MODELS list defined at the top of this file.
-    delay_between_calls  : Seconds to pause between successive API calls.
-                           Increase this if you encounter rate-limit errors (default: 1.0).
+    models               : List of OpenRouter model IDs to query. Defaults to MODELS.
+    delay_between_calls  : Seconds to pause between successive API calls. Applied
+                           both between the two calls per model and between models.
+                           Increase if you encounter rate-limit errors (default: 1.0).
 
     Returns
     ───────
-    A list of result dictionaries, one per model queried. Each dict contains all
-    extracted classification fields plus a "raw_response" and "error" key.
-    Failed model calls are included in the list with error details rather than
-    being silently dropped, so you always get one record per model per contract.
+    A list of merged result dictionaries, one per model queried. Each dict contains
+    all type fields, all sector fields, and both error keys. Failed calls appear
+    with null/[] fields rather than being silently dropped.
     """
     contract_text = load_contract_text(contract_file)
     selected_models = models or MODELS
@@ -593,24 +857,59 @@ def classify_contract(
     print(f"\U0001f916 Models to query : {len(selected_models)}")
     print("-" * 60)
 
-    system_prompt = build_system_prompt()
-    user_prompt = build_user_prompt(contract_text)
+    type_system_prompt   = build_system_prompt()
+    sector_system_prompt = build_sector_prompt()
+    user_prompt          = build_user_prompt(contract_text)
 
     results = []
     for i, model in enumerate(selected_models, 1):
-        print(f"[{i}/{len(selected_models)}] Querying {model} ...", end=" ", flush=True)
-        result = call_openrouter(model, system_prompt, user_prompt)
-        results.append(result)
+        # ── Call 1: contract type classification ────────────────────────────
+        print(f"[{i}/{len(selected_models)}] {model} — type classifier ...", end=" ", flush=True)
+        type_result = call_openrouter(model, type_system_prompt, user_prompt)
 
-        if result["error"]:
-            print(f"❌ ERROR: {result['error']}")
+        if type_result["error"]:
+            print(f"❌ TYPE ERROR: {type_result['error']} ({type_result.get('elapsed_type_s', '?')}s)")
         else:
-            primary = result.get("contract_type_primary")
-            secondary = result.get("contract_type_secondary")
             print(
-                f"✅ → {primary} → {secondary} → {result.get('subject_matter')} → {result.get('governing_law')} → {result.get('jurisdiction_city')}|{result.get('jurisdiction_country')}|{result.get('jurisdiction_court_type')} → {result.get('contract_language')}"
+                f"✅ {type_result.get('contract_type_primary')} | "
+                f"{type_result.get('contract_type_secondary')} | "
+                f"{type_result.get('subject_matter')} | "
+                f"{type_result.get('governing_law')} | "
+                f"{type_result.get('jurisdiction_city')}|"
+                f"{type_result.get('jurisdiction_country')}|"
+                f"{type_result.get('jurisdiction_court_type')} | "
+                f"{type_result.get('contract_language')} "
+                f"({type_result.get('elapsed_type_s', '?')}s)"
             )
 
+        # Respect rate limits between the two calls for this model
+        time.sleep(delay_between_calls)
+
+        # ── Call 2: regulated sector classification ─────────────────────────
+        print(f"[{i}/{len(selected_models)}] {model} — sector classifier ...", end=" ", flush=True)
+        sector_result = call_openrouter_sector(model, sector_system_prompt, user_prompt)
+
+        if sector_result["sector_error"]:
+            print(f"❌ SECTOR ERROR: {sector_result['sector_error']} ({sector_result.get('elapsed_sector_s', '?')}s)")
+        else:
+            print(f"✅ {sector_result.get('regulated_sectors')} ({sector_result.get('elapsed_sector_s', '?')}s)")
+
+        # ── Merge both results into one flat record ────────────────────────
+        merged = {
+            **type_result,
+            "regulated_sectors":   sector_result["regulated_sectors"],
+            "sector_raw_response": sector_result["sector_raw_response"],
+            "elapsed_sector_s":    sector_result["elapsed_sector_s"],
+            "elapsed_total_s":     round(
+                (type_result.get("elapsed_type_s") or 0.0)
+                + (sector_result.get("elapsed_sector_s") or 0.0),
+                2,
+            ),
+            "sector_error":        sector_result["sector_error"],
+        }
+        results.append(merged)
+
+        # Delay before moving to next model (skip after the last)
         if i < len(selected_models):
             time.sleep(delay_between_calls)
 
