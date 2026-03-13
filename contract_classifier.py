@@ -529,27 +529,112 @@ CLASSIFICATION LOGIC (CRITICAL — apply before assigning any sector)
 
 REGULATED SECTORS AND THEIR SIGNALS
 
-Banking & Financial Markets: credit institutions, investment firms, payment service providers, financial market infrastructures. Signals: banking licenses, payment processing, clearing, settlement, trading platforms, credit facilities, banks, insurers, asset managers, financial market operators.
-Insurance & Pensions: insurance undertakings, reinsurance, occupational pension funds (Solvency II / IORP II). Signals: insurance underwriting, policy administration, actuarial systems, claims processing, licensed insurers, pension fund administrators.
-Digital Infrastructure: internet exchange points (IXPs), DNS providers, TLD registries, cloud computing providers, data centres, CDN providers. Signals: data centre operations, cloud hosting (IaaS/PaaS), DNS/TLD management, internet exchange, CDN services.
-Managed ICT & Security Services (MSP/MSSP): managed service providers and managed security service providers. Signals: outsourced IT management, managed SOC, remote infrastructure monitoring, third-party cybersecurity administration.
-Energy: electricity, gas, oil, hydrogen, district heating — transmission, distribution, supply, generation. Signals: power generation, grid operation, gas transmission, oil pipelines, energy trading, smart metering, TSOs, DSOs, licensed energy suppliers.
-Transport: air, rail, maritime, road transport operators and infrastructure managers. Signals: airport operations, air traffic management, railway network management, port operations, vessel traffic services, road traffic management systems.
-Health & Life Sciences: hospitals, healthcare networks, labs. Signals: patient data systems (EHR), clinical operations, licensed healthcare providers.
-Manufacturing (Critical Goods): medical devices (MDR/IVDR), chemicals, computers/electronics, electrical equipment, machinery, motor vehicles. Signals: NACE codes C26-C30, medical device hardware, pharmaceutical manufacturing, automotive supply chains, industrial machinery production.
-Water & Wastewater: drinking water suppliers, wastewater treatment operators. Signals: water treatment, distribution network management, SCADA systems for water infrastructure, public water utilities.
-Public Administration & Defence: central and regional government bodies, entities processing sensitive government information. Signals: government agencies, classified information (EUCI), defence procurement, military systems.
-Space & Satellite Infrastructure: ground-based infrastructure supporting space-based services. Signals: satellite operations, ground station management, space-based positioning (PNT), earth observation infrastructure.
-Digital Providers (Platforms): online marketplaces, search engines, social networking platforms. Signals: user-generated content hosting, e-commerce platform operations, search algorithms, digital advertising marketplaces.
-Food, Waste & Postal Services: large-scale food production/processing, hazardous waste management, universal postal service providers. Signals: food safety certification (large scale), municipal waste systems, universal service obligation (USO) postal networks.
-Chemical & Nuclear: manufacturers of hazardous chemicals, nuclear facility operators. Signals: REACH-regulated substances, chemical plant operations, nuclear power generation, radioactive material handling.
-Research Organizations: research activities related to any of the above sectors. Signals: scientific research grants in energy/health/space, laboratory services for critical entities.
-High-Risk AI: AI systems used for recruitment/HR screening, educational assessment, or biometric identification/categorisation. Regulatory anchor: EU AI Act Annex III. Apply in addition to any primary sector — it is a horizontal tag, not a standalone replacement.
+Each sector is described with three tags:
+  <def>    — what entities and activities this sector covers
+  <signals> — contract keywords and phrases that indicate this sector applies
+  <note>   — special classification instructions (only where applicable)
+
+<sector label="Banking & Financial Markets">
+  <def>Credit institutions, investment firms, payment service providers, and financial market infrastructures.</def>
+  <signals>banking licenses, payment processing, clearing, settlement, trading platforms, credit facilities, banks, insurers, asset managers, financial market operators</signals>
+</sector>
+
+<sector label="Insurance & Pensions">
+  <def>Insurance undertakings, reinsurance companies, and occupational pension funds (Solvency II / IORP II).</def>
+  <signals>insurance underwriting, policy administration, actuarial systems, claims processing, licensed insurers, pension fund administrators</signals>
+</sector>
+
+<sector label="Digital Infrastructure">
+  <def>Internet exchange points (IXPs), DNS providers, TLD registries, cloud computing providers, data centres, and CDN providers.</def>
+  <signals>data centre operations, cloud hosting (IaaS/PaaS), DNS/TLD management, internet exchange, CDN services</signals>
+</sector>
+
+<sector label="Managed ICT & Security Services (MSP/MSSP)">
+  <def>Managed service providers and managed security service providers delivering outsourced IT or security operations.</def>
+  <signals>outsourced IT management, managed SOC, remote infrastructure monitoring, third-party cybersecurity administration</signals>
+</sector>
+
+<sector label="Energy">
+  <def>Electricity, gas, oil, hydrogen, and district heating operators — covering transmission, distribution, supply, and generation.</def>
+  <signals>power generation, grid operation, gas transmission, oil pipelines, energy trading, smart metering, TSOs, DSOs, licensed energy suppliers</signals>
+</sector>
+
+<sector label="Transport">
+  <def>Air, rail, maritime, and road transport operators and infrastructure managers.</def>
+  <signals>airport operations, air traffic management, railway network management, port operations, vessel traffic services, road traffic management systems</signals>
+</sector>
+
+<sector label="Health & Life Sciences">
+  <def>Hospitals, healthcare networks, and diagnostic or research laboratories.</def>
+  <signals>patient data systems (EHR), clinical operations, licensed healthcare providers, medical diagnostics</signals>
+</sector>
+
+<sector label="Manufacturing (Critical Goods)">
+  <def>Manufacturers of medical devices (MDR/IVDR), chemicals, computers and electronics, electrical equipment, machinery, and motor vehicles.</def>
+  <signals>NACE codes C26–C30, medical device hardware, pharmaceutical manufacturing, automotive supply chains, industrial machinery production</signals>
+</sector>
+
+<sector label="Water & Wastewater">
+  <def>Drinking water suppliers and wastewater treatment operators.</def>
+  <signals>water treatment, distribution network management, SCADA systems for water infrastructure, public water utilities</signals>
+</sector>
+
+<sector label="Public Administration & Defence">
+  <def>Central and regional government bodies and entities processing sensitive government information.</def>
+  <signals>government agencies, classified information (EUCI), defence procurement, military systems</signals>
+</sector>
+
+<sector label="Space & Satellite Infrastructure">
+  <def>Operators of ground-based infrastructure supporting space-based services.</def>
+  <signals>satellite operations, ground station management, space-based positioning (PNT), earth observation infrastructure</signals>
+</sector>
+
+<sector label="Digital Providers (Platforms)">
+  <def>Online marketplaces, search engines, and social networking service platforms.</def>
+  <signals>user-generated content hosting, e-commerce platform operations, search algorithms, digital advertising marketplaces</signals>
+</sector>
+
+<sector label="Food, Waste & Postal Services">
+  <def>Large-scale food production and processing companies, hazardous waste management operators, and universal postal service providers.</def>
+  <signals>food safety certification (large scale), municipal waste systems, universal service obligation (USO) postal networks</signals>
+</sector>
+
+<sector label="Chemical & Nuclear">
+  <def>Manufacturers of hazardous chemicals and operators of nuclear facilities.</def>
+  <signals>REACH-regulated substances, chemical plant operations, nuclear power generation, radioactive material handling</signals>
+</sector>
+
+<sector label="Research Organizations">
+  <def>Organisations conducting research activities directly related to any of the above regulated sectors.</def>
+  <signals>scientific research grants in energy/health/space, laboratory services for critical entities</signals>
+</sector>
+
+<sector label="High-Risk AI">
+  <def>AI systems used for recruitment or HR screening, educational assessment, or biometric identification and categorisation (EU AI Act Annex III).</def>
+  <signals>AI-powered CV screening, automated hiring tools, student assessment AI, facial recognition, biometric access control</signals>
+  <note>This is a HORIZONTAL label. It must be added alongside any primary sector label — never as the sole entry unless no other sector applies. Regulatory anchor: EU AI Act Annex III.</note>
+</sector>
 
 RULES:
 - Respond ONLY with a valid JSON object. No preamble or markdown.
-- "regulated_sectors": A JSON array of applicable sector labels, using EXACTLY the names listed above.
-- Return [] if no regulated sector applies.
+- "regulated_sectors": A JSON array of sector labels. You MUST use the label strings EXACTLY as they appear in the following canonical list — copy them character-for-character, including parenthetical suffixes:
+    "Banking & Financial Markets"
+    "Insurance & Pensions"
+    "Digital Infrastructure"
+    "Managed ICT & Security Services (MSP/MSSP)"
+    "Energy"
+    "Transport"
+    "Health & Life Sciences"
+    "Manufacturing (Critical Goods)"
+    "Water & Wastewater"
+    "Public Administration & Defence"
+    "Space & Satellite Infrastructure"
+    "Digital Providers (Platforms)"
+    "Food, Waste & Postal Services"
+    "Chemical & Nuclear"
+    "Research Organizations"
+    "High-Risk AI"
+- Return [] if no sector applies. Do NOT invent, abbreviate, or paraphrase any label.
 - Apply ALL sectors that are triggered — a single contract may touch several.
 - Do NOT infer a sector from the party's general industry if the contract's subject matter does not involve that sector's regulated activities.
 
