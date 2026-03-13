@@ -58,8 +58,10 @@ The script expects a single environment variable:
 
 USAGE (command line)
 ────────────────────
-  python contract_classifier.py --contract path/to/contract.txt
-  python contract_classifier.py --contract path/to/contract.md --output results.json
+  python contract_classifier.py --contract path/to/scanned_contract_121.txt
+      → saves to path/to/results-scanned_contract_121.json (auto-derived)
+  python contract_classifier.py --contract path/to/contract.md --output my_output.json
+      → saves to my_output.json (explicit override)
 
 OUTPUT FORMAT (one record per model queried)
 ────────────────────────────────────────────
@@ -1010,8 +1012,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--output",
-        default="results.json",
-        help="Path to save JSON results (default: results.json)",
+        default=None,
+        help=(
+            "Path to save JSON results. "
+            "Defaults to 'results-<contract stem>.json' in the same directory "
+            "as the contract file (e.g. 'results-scanned_contract_121.json')."
+        ),
     )
     parser.add_argument(
         "--delay",
@@ -1026,11 +1032,18 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    contract_path = Path(args.contract)
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        # Build "results-<stem>.json" next to the contract file.
+        # e.g. /docs/scanned_contract_121.txt → /docs/results-scanned_contract_121.json
+        output_path = contract_path.parent / f"results-{contract_path.stem}.json"
+
     results = classify_contract(
         contract_file=args.contract,
         delay_between_calls=args.delay,
     )
 
-    output_path = Path(args.output)
     output_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
     print(f"\n💾 Full results saved to: {output_path}")
