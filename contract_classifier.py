@@ -4,13 +4,16 @@ Sends the same query to multiple small/efficient LLMs and returns structured JSO
 """
 
 import os
+import re
 import json
 import time
 from pathlib import Path
 from typing import Optional
 
 import httpx
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic.functional_validators import BeforeValidator
+from typing import Annotated
 from dotenv import load_dotenv
 
 # ── Load environment ──────────────────────────────────────────────────────────
@@ -34,16 +37,17 @@ MODELS = [
 # ── Pydantic output model ─────────────────────────────────────────────────────
 class ContractClassification(BaseModel):
     contract_type_primary: str
-    contract_type_secondary: list[str]
+    contract_type_secondary: Annotated[list[str], BeforeValidator(lambda v: [] if v is None else v)] = Field(default_factory=list)
     subject_matter: str
     governing_law: str
-    jurisdiction: list[str]
+    jurisdiction_city: Optional[str]
+    jurisdiction_country: Optional[str]
+    jurisdiction_court_type: Optional[str]
     contract_language: str
 
     @field_validator(
         "contract_type_primary",
         "subject_matter",
-        "governing_law",
         "contract_language",
     )
     def strip_whitespace(cls, v: str) -> str:
@@ -51,46 +55,47 @@ class ContractClassification(BaseModel):
             return v.strip()
         return v
 
-    @field_validator("contract_type_secondary")
-    def ensure_list_of_str(cls, v: list) -> list[str]:
+    @field_validator("governing_law")
+    def normalise_governing_law(cls, v: Optional[str]) -> Optional[str]:
+        """Coerce NULL / N/A sentinel strings to None for consistency with jurisdiction fields."""
         if v is None:
-            return []
-        return [str(x).strip() for x in v]
+            return None
+        v = str(v).strip()
+        return None if v.upper() in ("NULL", "N/A", "") else v
 
-    @field_validator("jurisdiction")
-    def validate_jurisdiction(cls, v) -> list[str]:
-        """
-        Accepts either:
-          - a JSON array of exactly 3 strings: [CITY, ISO2_COUNTRY_CODE, COURT_TYPE]
-          - the legacy underscore string "CITY_CC_TYPE" (backwards-compat / model slip)
-          - the string "N/A"
-        Always returns a list[str] with all entries uppercased and stripped.
-        """
+
+    @field_validator("jurisdiction_city", "jurisdiction_country", "jurisdiction_court_type")
+    def normalise_jurisdiction_field(cls, v: Optional[str]) -> Optional[str]:
+        """Uppercase, strip whitespace, and coerce empty / null strings to None."""
         if v is None:
-            return ["N/A"]
+            return None
+        v = str(v).strip().upper()
+        return None if v in ("", "NULL", "N/A") else v
 
-        # Model returned the old underscore format or plain "N/A" as a string
-        if isinstance(v, str):
-            v = v.strip()
-            if v.upper() == "N/A":
-                return ["N/A"]
-            parts = v.split("_")
-            if len(parts) == 3:
-                return [p.strip().upper() for p in parts]
+    @model_validator(mode="after")
+    def validate_jurisdiction_coherence(self) -> "ContractClassification":
+        """
+        Enforce that jurisdiction fields are coherent:
+          - If all three are None → fine (no jurisdiction stated).
+          - If jurisdiction_country or jurisdiction_court_type is populated,
+            the other must also be populated (city is allowed to be None).
+          - jurisdiction_city must not be set without country + court_type.
+        """
+        city = self.jurisdiction_city
+        country = self.jurisdiction_country
+        court_type = self.jurisdiction_court_type
+        populated = [f for f in (country, court_type) if f is not None]
+        if len(populated) not in (0, 2):
             raise ValueError(
-                f"jurisdiction string must be 'N/A' or 'CITY_ISO2_COURT_TYPE', got: {v!r}"
+                f"jurisdiction_country and jurisdiction_court_type must both be set or both be NULL. "
+                f"Got: country={country!r}, court_type={court_type!r}"
             )
-
-        if isinstance(v, list):
-            if len(v) == 1 and str(v[0]).strip().upper() == "N/A":
-                return ["N/A"]
-            if len(v) != 3:
-                raise ValueError(
-                    f"jurisdiction array must have exactly 3 elements [CITY, ISO2, COURT_TYPE], got {len(v)}: {v}"
-                )
-            return [str(entry).strip().upper() for entry in v]
-
-        raise ValueError(f"jurisdiction must be a list or string, got: {type(v)}")
+        if city is not None and country is None:
+            raise ValueError(
+                f"jurisdiction_city is set to {city!r} but jurisdiction_country is NULL — "
+                "a city cannot be provided without a country."
+            )
+        return self
 
 
 # ── Prompt builder ────────────────────────────────────────────────────────────
@@ -154,29 +159,82 @@ RULES:
 - "contract_type_primary": Must be EXACTLY one label from the PRIMARY TYPES list. Follow the Hierarchy strictly.
 - "contract_type_secondary": A JSON array of labels from the SECONDARY TYPES list. Empty array [] if none.
 - "subject_matter": Must be verbatim from the ALLOWED SUBJECT MATTERS list (text before the colon).
-- "governing_law": The exact law mentioned (e.g., "English law"). If not stated, "N/A".
-- "jurisdiction": Extract the court venue and return it as a JSON array with exactly 3 UPPERCASE string entries: ["CITY", "ISO2_COUNTRY_CODE", "COURT_TYPE"]. Rules:
-    - CITY: the city name in UPPERCASE. If no city is mentioned (e.g., "Courts of France"), use "NULL".
-    - ISO2_COUNTRY_CODE: the 2-letter ISO 3166-1 alpha-2 country code in UPPERCASE (e.g., "FR", "DE", "GB", "IT", "NL").
-    - COURT_TYPE: must be exactly one of (in UPPERCASE): "GENERAL", "COMMERCIAL", "HIGH", "STATE", "FEDERAL", "CHANCERY", "INTERNATIONAL COMMERCIAL COURT", "TRIBUNAL", "SMALL CLAIMS", "ARBITRATION", "IP", "NATIONAL".
+- "governing_law": The exact law mentioned (e.g., "English law"). If not stated, use NULL.
+- "jurisdiction_city": The city of the court venue in UPPERCASE (e.g., "PARIS", "LONDON"). Use NULL if no city is mentioned (e.g. "Courts of France") or if no jurisdiction is stated at all.
+- "jurisdiction_country": The 2-letter ISO 3166-1 alpha-2 country code in UPPERCASE (e.g., "FR", "DE", "GB", "IT", "NL"). Extract the country even when no city is mentioned (e.g. "Courts of France" → "FR", "Italian courts" → "IT"). Use NULL only if no jurisdiction is stated at all.
+- "jurisdiction_court_type": Must be exactly one of (in UPPERCASE): "GENERAL", "COMMERCIAL", "HIGH", "STATE", "FEDERAL", "CHANCERY", "INTERNATIONAL COMMERCIAL COURT", "TRIBUNAL", "SMALL CLAIMS", "ARBITRATION", "IP", "NATIONAL". Rules:
       * If the text says "courts of [City]" with no further specificity: use "GENERAL".
       * If the text says "Competent courts": use "GENERAL".
-      * If no city is mentioned but a country is (e.g., "Courts of France", "Italian courts"): use "NULL" for city and "NATIONAL" for type.
-      * Otherwise match the court type from context (e.g., "Commercial Court of Paris" → ["PARIS", "FR", "COMMERCIAL"]).
-    - If no jurisdiction is stated at all: use ["N/A"].
-    - Examples: ["PARIS", "FR", "COMMERCIAL"], ["LONDON", "GB", "HIGH"], ["NULL", "IT", "NATIONAL"], ["AMSTERDAM", "NL", "GENERAL"].
+      * If no city is mentioned but a country is (e.g., "Courts of France", "Italian courts"): use "NATIONAL".
+      * Otherwise match from context (e.g., "Commercial Court of Paris" → "COMMERCIAL").
+      * Use NULL only if no jurisdiction is stated at all.
+    - Examples: jurisdiction_city="PARIS" jurisdiction_country="FR" jurisdiction_court_type="COMMERCIAL" | jurisdiction_city=NULL jurisdiction_country="IT" jurisdiction_court_type="NATIONAL" | jurisdiction_city="AMSTERDAM" jurisdiction_country="NL" jurisdiction_court_type="GENERAL".
 - "contract_language": The natural language the contract is written in (e.g., "English", "French", "German"). Detect from the document text itself.
 
-EXAMPLE OUTPUT:
+EXAMPLE OUTPUT (jurisdiction with city):
 {{
   "contract_type_primary": "IP_LICENSING_AND_TECH",
   "contract_type_secondary": ["DATA_PRIVACY", "FINANCIAL_COMMITMENT"],
   "subject_matter": "Information Technology & Digital Systems",
   "governing_law": "Dutch law",
-  "jurisdiction": ["AMSTERDAM", "NL", "GENERAL"],
+  "jurisdiction_city": "AMSTERDAM",
+  "jurisdiction_country": "NL",
+  "jurisdiction_court_type": "GENERAL",
+  "contract_language": "English"
+}}
+
+EXAMPLE OUTPUT (jurisdiction country-only, no city):
+{{
+  "contract_type_primary": "SERVICES",
+  "contract_type_secondary": ["FINANCIAL_COMMITMENT"],
+  "subject_matter": "Professional & Operational Services",
+  "governing_law": "French law",
+  "jurisdiction_city": NULL,
+  "jurisdiction_country": "FR",
+  "jurisdiction_court_type": "NATIONAL",
+  "contract_language": "French"
+}}
+
+EXAMPLE OUTPUT (no jurisdiction stated):
+{{
+  "contract_type_primary": "SERVICES",
+  "contract_type_secondary": [],
+  "subject_matter": "Professional & Operational Services",
+  "governing_law": NULL,
+  "jurisdiction_city": NULL,
+  "jurisdiction_country": NULL,
+  "jurisdiction_court_type": NULL,
   "contract_language": "English"
 }}
 """
+
+
+def clean_contract_text(text: str) -> str:
+    """
+    Normalise contract text arriving from OCS, which may be plain text or Markdown.
+
+    OCS markdown artefacts that can confuse the classifier:
+      - Heading markers (# / ## / ###) add no semantic value and inflate tokens.
+      - Horizontal rules (--- / ***) are purely visual.
+      - Bold/italic markers (** / * / __ / _) around clause headings are noise.
+      - Redundant blank lines (3+) waste context window space.
+      - Non-breaking spaces and other Unicode whitespace variants can break
+        tokenisation and regex matching inside the model.
+
+    Plain-text OCS exports are kept as-is apart from whitespace normalisation.
+    """
+    # Normalise Unicode whitespace (NBSP, thin space, zero-width space, etc.)
+    text = re.sub(u"[\u00a0\u200b\u200c\u200d\u2009\u202f\ufeff]", " ", text)
+    # Strip Markdown headings (keep the heading text itself)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # Strip horizontal rules
+    text = re.sub(r"^\s*[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
+    # Strip bold / italic markers (**, *, __, _)
+    text = re.sub(r"(\*\*|__)(.+?)\1", r"\2", text, flags=re.DOTALL)
+    text = re.sub(r"(\*|_)(.+?)\1", r"\2", text, flags=re.DOTALL)
+    # Collapse 3+ consecutive blank lines to 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def build_user_prompt(contract_text: str) -> str:
@@ -186,10 +244,11 @@ def build_user_prompt(contract_text: str) -> str:
       and help models separate instruction from content.
     - Reminder of output format at the end (recency bias in attention).
     """
+    contract_text = clean_contract_text(contract_text)
     return f"""Classify the following contract document.
 
 <contract_text>
-{contract_text.strip()}
+{contract_text}
 </contract_text>
 
 Respond with ONLY the JSON object as specified. No other text."""
@@ -218,8 +277,8 @@ def call_openrouter(
         ],
         # Optimisation: low temperature for deterministic classification
         "temperature": 0.0,
-        # Optimisation: limit tokens — a JSON response needs very few
-        "max_tokens": 150,
+        # Optimisation: limit tokens — raised to 300 to avoid truncation on verbose responses
+        "max_tokens": 300,
         # Ask for JSON output where the API supports it (not all models do via OpenRouter)
         "response_format": {"type": "json_object"},
     }
@@ -233,11 +292,8 @@ def call_openrouter(
         raw_content = data["choices"][0]["message"]["content"].strip()
 
         # Robustness: strip markdown code fences if model ignores the instruction
-        if raw_content.startswith("```"):
-            raw_content = raw_content.split("```")[1]
-            if raw_content.startswith("json"):
-                raw_content = raw_content[4:]
-            raw_content = raw_content.strip()
+        raw_content = re.sub(r"^```(?:json)?\s*", "", raw_content, flags=re.IGNORECASE)
+        raw_content = re.sub(r"\s*```$", "", raw_content).strip()
 
         parsed_json = json.loads(raw_content)
         result = ContractClassification(**parsed_json)
@@ -248,7 +304,9 @@ def call_openrouter(
             "contract_type_secondary": result.contract_type_secondary,
             "subject_matter": result.subject_matter,
             "governing_law": result.governing_law,
-            "jurisdiction": result.jurisdiction,
+            "jurisdiction_city": result.jurisdiction_city,
+            "jurisdiction_country": result.jurisdiction_country,
+            "jurisdiction_court_type": result.jurisdiction_court_type,
             "contract_language": result.contract_language,
             "raw_response": raw_content,
             "error": None,
@@ -262,7 +320,9 @@ def call_openrouter(
             "raw_response": None,
             "subject_matter": None,
             "governing_law": None,
-            "jurisdiction": None,
+            "jurisdiction_city": None,
+            "jurisdiction_country": None,
+            "jurisdiction_court_type": None,
             "contract_language": None,
             "error": f"HTTP {e.response.status_code}: {e.response.text}",
         }
@@ -274,7 +334,9 @@ def call_openrouter(
             "raw_response": raw_content if "raw_content" in locals() else None,
             "subject_matter": None,
             "governing_law": None,
-            "jurisdiction": None,
+            "jurisdiction_city": None,
+            "jurisdiction_country": None,
+            "jurisdiction_court_type": None,
             "contract_language": None,
             "error": f"JSON parse error: {e}",
         }
@@ -286,7 +348,9 @@ def call_openrouter(
             "raw_response": None,
             "subject_matter": None,
             "governing_law": None,
-            "jurisdiction": None,
+            "jurisdiction_city": None,
+            "jurisdiction_country": None,
+            "jurisdiction_court_type": None,
             "contract_language": None,
             "error": str(e),
         }
@@ -336,7 +400,7 @@ def classify_contract(
             primary = result.get("contract_type_primary")
             secondary = result.get("contract_type_secondary")
             print(
-                f"✅ → {primary} → {secondary} → {result.get('subject_matter')} → {result.get('governing_law')} → {result.get('jurisdiction')} → {result.get('contract_language')}"
+                f"✅ → {primary} → {secondary} → {result.get('subject_matter')} → {result.get('governing_law')} → {result.get('jurisdiction_city')}|{result.get('jurisdiction_country')}|{result.get('jurisdiction_court_type')} → {result.get('contract_language')}"
             )
 
         if i < len(selected_models):
