@@ -167,7 +167,7 @@ class ContractClassification(BaseModel):
     contract_type_primary: str
     contract_type_secondary: Annotated[list[str], BeforeValidator(lambda v: [] if v is None else v)] = Field(default_factory=list)
     subject_matter: str
-    governing_law: str
+    governing_law: Annotated[Optional[str], BeforeValidator(lambda v: None if v is None or str(v).strip().upper() in ("NULL", "N/A", "") else v)] = None
     jurisdiction_city: Optional[str]
     jurisdiction_country: Optional[str]
     jurisdiction_court_type: Optional[str]
@@ -184,13 +184,6 @@ class ContractClassification(BaseModel):
             return v.strip()
         return v
 
-    @field_validator("governing_law")
-    def normalise_governing_law(cls, v: Optional[str]) -> Optional[str]:
-        """Coerce NULL / N/A sentinel strings to None for consistency with jurisdiction fields."""
-        if v is None:
-            return None
-        v = str(v).strip()
-        return None if v.upper() in ("NULL", "N/A", "") else v
 
 
     @field_validator("jurisdiction_city", "jurisdiction_country", "jurisdiction_court_type")
