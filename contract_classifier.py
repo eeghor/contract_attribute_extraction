@@ -125,6 +125,7 @@ OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODELS = [
     # "qwen/qwen3.5-122b-a10b",  # Larger, slower, higher-quality alternative
     "nvidia/nemotron-3-super-120b-a12b:free"
+    # "qwen/qwen3.5-27b"
     # "qwen/qwen3.5-flash-02-23",  # Default: fast, cost-efficient, good at structured extraction
 ]
 
@@ -672,6 +673,35 @@ EXAMPLE OUTPUT (AI recruitment tool for a hospital):
 """
 
 
+def _extract_json(text: str) -> str:
+    """
+    Extract the first top-level JSON object from a model response.
+
+    Some models emit reasoning or thinking tokens (e.g. <think>...</think>)
+    before or after the JSON payload, or include trailing commentary. This
+    function strips those artefacts and returns only the JSON object string,
+    ready for json.loads().
+    """
+    # Remove <think>...</think> blocks (and similar reasoning wrappers)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Strip markdown code fences
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text).strip()
+    # Find the first '{' and the matching closing '}'
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("No JSON object found in model response")
+    depth = 0
+    for i, ch in enumerate(text[start:], start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    raise ValueError("Unbalanced braces in model response — JSON object not closed")
+
+
 def call_openrouter_sector(
     model: str,
     sector_system_prompt: str,
@@ -725,9 +755,12 @@ def call_openrouter_sector(
             response.raise_for_status()
             data = response.json()
 
-        raw_content = data["choices"][0]["message"]["content"].strip()
-        raw_content = re.sub(r"^```(?:json)?\s*", "", raw_content, flags=re.IGNORECASE)
-        raw_content = re.sub(r"\s*```$", "", raw_content).strip()
+        content = data["choices"][0]["message"]["content"]
+        if content is None:
+            raise ValueError(
+                "Model returned null content (possible content filter or empty response)"
+            )
+        raw_content = _extract_json(content)
 
         parsed_json = json.loads(raw_content)
         result = SectorClassification(**parsed_json)
@@ -834,11 +867,12 @@ def call_openrouter(
             response.raise_for_status()
             data = response.json()
 
-        raw_content = data["choices"][0]["message"]["content"].strip()
-
-        # Robustness: strip markdown code fences if model ignores the instruction
-        raw_content = re.sub(r"^```(?:json)?\s*", "", raw_content, flags=re.IGNORECASE)
-        raw_content = re.sub(r"\s*```$", "", raw_content).strip()
+        content = data["choices"][0]["message"]["content"]
+        if content is None:
+            raise ValueError(
+                "Model returned null content (possible content filter or empty response)"
+            )
+        raw_content = _extract_json(content)
 
         parsed_json = json.loads(raw_content)
         result = ContractClassification(**parsed_json)
@@ -1049,8 +1083,7 @@ if __name__ == "__main__":
         default=None,
         help=(
             "Path to save JSON results. "
-            "Defaults to 'results-<contract stem>.json' in the same directory "
-            "as the contract file (e.g. 'results-scanned_contract_121.json')."
+            "Defaults to 'results-<contract stem>.json' for single file, or 'results-batch.json' for batch mode."
         ),
     )
     parser.add_argument(
@@ -1059,25 +1092,70 @@ if __name__ == "__main__":
         default=1.0,
         help="Delay in seconds between API calls (default: 1.0)",
     )
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
         "--contract",
-        required=True,
         help="Path to the contract text file to classify.",
+    )
+    group.add_argument(
+        "--batch_dir",
+        help="Directory containing .md or .txt files to classify in batch mode.",
     )
     args = parser.parse_args()
 
-    contract_path = Path(args.contract)
-    if args.output:
-        output_path = Path(args.output)
+    labelled_dir = Path(__file__).parent / "labelled_contracts"
+    labelled_dir.mkdir(exist_ok=True)
+
+    if args.batch_dir:
+        batch_dir = Path(args.batch_dir)
+        files = sorted(
+            [
+                f
+                for f in batch_dir.iterdir()
+                if f.suffix in {".md", ".txt"} and f.is_file()
+            ]
+        )
+        print(f"Batch mode: {len(files)} files found in {batch_dir}")
+        all_results = []
+        total_files = len(files)
+        for i, file in enumerate(files, 1):
+            print(f"\nProcessing contract {i}/{total_files}: {file.name}")
+            results = classify_contract(
+                contract_file=str(file),
+                delay_between_calls=args.delay,
+            )
+            all_results.extend(results)
+        print(f"\nBatch processing complete: {total_files} contracts processed.")
+        # Determine model name for output file
+        model_name = None
+        if all_results:
+            # Use the first result's model field, get the part after '/'
+            model_field = all_results[0].get("model", "model")
+            model_name = model_field.split("/")[-1]
+        else:
+            model_name = "model"
+        output_filename = f"results-{total_files}-{model_name}.json"
+        output_path = (
+            Path(args.output) if args.output else labelled_dir / output_filename
+        )
+        output_path.write_text(json.dumps(all_results, indent=2), encoding="utf-8")
+        print(f"\n💾 Batch results saved to: {output_path}")
     else:
-        # Build "results-<stem>.json" next to the contract file.
-        # e.g. /docs/scanned_contract_121.txt → /docs/results-scanned_contract_121.json
-        output_path = contract_path.parent / f"results-{contract_path.stem}.json"
-
-    results = classify_contract(
-        contract_file=args.contract,
-        delay_between_calls=args.delay,
-    )
-
-    output_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
-    print(f"\n💾 Full results saved to: {output_path}")
+        contract_path = Path(args.contract)
+        results = classify_contract(
+            contract_file=args.contract,
+            delay_between_calls=args.delay,
+        )
+        # Determine model name for output file
+        model_name = None
+        if results:
+            model_field = results[0].get("model", "model")
+            model_name = model_field.split("/")[-1]
+        else:
+            model_name = "model"
+        output_filename = f"results-{len(results)}-{model_name}.json"
+        output_path = (
+            Path(args.output) if args.output else labelled_dir / output_filename
+        )
+        output_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        print(f"\n💾 Full results saved to: {output_path}")
