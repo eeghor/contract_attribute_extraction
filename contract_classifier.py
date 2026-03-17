@@ -124,7 +124,8 @@ OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 # To query multiple models, uncomment additional entries or add new ones.
 MODELS = [
     # "qwen/qwen3.5-122b-a10b",  # Larger, slower, higher-quality alternative
-    "qwen/qwen3.5-flash-02-23",  # Default: fast, cost-efficient, good at structured extraction
+    "nvidia/nemotron-3-super-120b-a12b:free"
+    # "qwen/qwen3.5-flash-02-23",  # Default: fast, cost-efficient, good at structured extraction
 ]
 
 
@@ -186,10 +187,22 @@ class ContractClassification(BaseModel):
       instructs the model to always infer country from city, so this
       fallback should be rare in practice.
     """
+
     contract_type_primary: str
-    contract_type_secondary: Annotated[list[str], BeforeValidator(lambda v: [] if v is None else v)] = Field(default_factory=list)
+    contract_type_secondary: Annotated[
+        list[str], BeforeValidator(lambda v: [] if v is None else v)
+    ] = Field(default_factory=list)
     subject_matter: str
-    governing_law: Annotated[Optional[str], BeforeValidator(lambda v: None if v is None or str(v).strip().upper() in ("NULL", "N/A", "") else v)] = None
+    governing_law: Annotated[
+        Optional[str],
+        BeforeValidator(
+            lambda v: (
+                None
+                if v is None or str(v).strip().upper() in ("NULL", "N/A", "")
+                else v
+            )
+        ),
+    ] = None
     jurisdiction_city: Optional[str]
     jurisdiction_country: Optional[str]
     jurisdiction_court_type: Optional[str]
@@ -206,9 +219,9 @@ class ContractClassification(BaseModel):
             return v.strip()
         return v
 
-
-
-    @field_validator("jurisdiction_city", "jurisdiction_country", "jurisdiction_court_type")
+    @field_validator(
+        "jurisdiction_city", "jurisdiction_country", "jurisdiction_court_type"
+    )
     def normalise_jurisdiction_field(cls, v: Optional[str]) -> Optional[str]:
         """Uppercase, strip whitespace, and coerce empty / null strings to None."""
         if v is None:
@@ -393,7 +406,7 @@ def clean_contract_text(text: str) -> str:
     Plain-text exports are returned unchanged except for whitespace normalisation.
     """
     # Normalise Unicode whitespace (NBSP, thin space, zero-width space, etc.)
-    text = re.sub(u"[\u00a0\u200b\u200c\u200d\u2009\u202f\ufeff]", " ", text)
+    text = re.sub("[\u00a0\u200b\u200c\u200d\u2009\u202f\ufeff]", " ", text)
     # Strip Markdown headings (keep the heading text itself)
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
     # Strip horizontal rules
@@ -430,28 +443,29 @@ def build_user_prompt(contract_text: str) -> str:
 Respond with ONLY the JSON object as specified. No other text."""
 
 
-
 # ── Allowed regulated sector labels ──────────────────────────────────────────
 # Canonical labels matching the NIS2 / DORA / CER / AI Act taxonomy.
 # The sector validator uses this set to reject any label the model invents.
-VALID_SECTORS: frozenset = frozenset({
-    "Banking & Financial Markets",
-    "Insurance & Pensions",
-    "Digital Infrastructure",
-    "Managed ICT & Security Services (MSP/MSSP)",
-    "Energy",
-    "Transport",
-    "Health & Life Sciences",
-    "Manufacturing (Critical Goods)",
-    "Water & Wastewater",
-    "Public Administration & Defence",
-    "Space & Satellite Infrastructure",
-    "Digital Providers (Platforms)",
-    "Food, Waste & Postal Services",
-    "Chemical & Nuclear",
-    "Research Organizations",
-    "High-Risk AI",  # AI Act horizontal layer — co-exists with any primary sector
-})
+VALID_SECTORS: frozenset = frozenset(
+    {
+        "Banking & Financial Markets",
+        "Insurance & Pensions",
+        "Digital Infrastructure",
+        "Managed ICT & Security Services (MSP/MSSP)",
+        "Energy",
+        "Transport",
+        "Health & Life Sciences",
+        "Manufacturing (Critical Goods)",
+        "Water & Wastewater",
+        "Public Administration & Defence",
+        "Space & Satellite Infrastructure",
+        "Digital Providers (Platforms)",
+        "Food, Waste & Postal Services",
+        "Chemical & Nuclear",
+        "Research Organizations",
+        "High-Risk AI",  # AI Act horizontal layer — co-exists with any primary sector
+    }
+)
 
 
 # ── Pydantic sector model ─────────────────────────────────────────────────────
@@ -478,6 +492,7 @@ class SectorClassification(BaseModel):
       error rather than silently storing a hallucinated sector name.
     - Each label is stripped of whitespace before matching.
     """
+
     regulated_sectors: Annotated[
         list[str],
         BeforeValidator(lambda v: [] if v is None else v),
@@ -746,6 +761,7 @@ def call_openrouter_sector(
             "sector_error": str(e),
         }
 
+
 # ── API call ──────────────────────────────────────────────────────────────────
 def call_openrouter(
     model: str,
@@ -944,18 +960,27 @@ def classify_contract(
     print(f"\U0001f916 Models to query : {len(selected_models)}")
     print("-" * 60)
 
-    type_system_prompt   = build_system_prompt()
+    type_system_prompt = build_system_prompt()
     sector_system_prompt = build_sector_prompt()
-    user_prompt          = build_user_prompt(contract_text)
+    user_prompt = build_user_prompt(contract_text)
+
+    # Derive contract_id from filename (replace dashes with underscores, remove extension)
+    contract_id = Path(contract_file).stem.replace("-", "_")
 
     results = []
     for i, model in enumerate(selected_models, 1):
         # ── Call 1: contract type classification ────────────────────────────
-        print(f"[{i}/{len(selected_models)}] {model} — type classifier ...", end=" ", flush=True)
+        print(
+            f"[{i}/{len(selected_models)}] {model} — type classifier ...",
+            end=" ",
+            flush=True,
+        )
         type_result = call_openrouter(model, type_system_prompt, user_prompt)
 
         if type_result["error"]:
-            print(f"❌ TYPE ERROR: {type_result['error']} ({type_result.get('elapsed_type_s', '?')}s)")
+            print(
+                f"❌ TYPE ERROR: {type_result['error']} ({type_result.get('elapsed_type_s', '?')}s)"
+            )
         else:
             print(
                 f"✅ {type_result.get('contract_type_primary')} | "
@@ -973,26 +998,35 @@ def classify_contract(
         time.sleep(delay_between_calls)
 
         # ── Call 2: regulated sector classification ─────────────────────────
-        print(f"[{i}/{len(selected_models)}] {model} — sector classifier ...", end=" ", flush=True)
+        print(
+            f"[{i}/{len(selected_models)}] {model} — sector classifier ...",
+            end=" ",
+            flush=True,
+        )
         sector_result = call_openrouter_sector(model, sector_system_prompt, user_prompt)
 
         if sector_result["sector_error"]:
-            print(f"❌ SECTOR ERROR: {sector_result['sector_error']} ({sector_result.get('elapsed_sector_s', '?')}s)")
+            print(
+                f"❌ SECTOR ERROR: {sector_result['sector_error']} ({sector_result.get('elapsed_sector_s', '?')}s)"
+            )
         else:
-            print(f"✅ {sector_result.get('regulated_sectors')} ({sector_result.get('elapsed_sector_s', '?')}s)")
+            print(
+                f"✅ {sector_result.get('regulated_sectors')} ({sector_result.get('elapsed_sector_s', '?')}s)"
+            )
 
         # ── Merge both results into one flat record ────────────────────────
         merged = {
             **type_result,
-            "regulated_sectors":   sector_result["regulated_sectors"],
+            "regulated_sectors": sector_result["regulated_sectors"],
             "sector_raw_response": sector_result["sector_raw_response"],
-            "elapsed_sector_s":    sector_result["elapsed_sector_s"],
-            "elapsed_total_s":     round(
+            "elapsed_sector_s": sector_result["elapsed_sector_s"],
+            "elapsed_total_s": round(
                 (type_result.get("elapsed_type_s") or 0.0)
                 + (sector_result.get("elapsed_sector_s") or 0.0),
                 2,
             ),
-            "sector_error":        sector_result["sector_error"],
+            "sector_error": sector_result["sector_error"],
+            "contract_id": contract_id,
         }
         results.append(merged)
 
