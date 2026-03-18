@@ -31,14 +31,20 @@ HOW IT WORKS (step by step)
   1. LOAD    – The contract file is read from disk.
   2. CLEAN   – Markdown formatting artefacts (headings, bold, rules) are stripped
                so they do not confuse the AI model.
-  3. PROMPT  – Two separate instruction sets are prepared:
+  3. PROMPT  – Three separate instruction sets are prepared:
                (a) Type classifier: what kind of contract is this, what does it
                    cover, which law and court apply, what language is it in?
                (b) Sector classifier: does this contract touch any EU-regulated
                    sector under NIS2, DORA, CER, or the AI Act?
-  4. QUERY   – For each AI model, both prompts are sent sequentially (chained):
-               call (a) completes first, then call (b) runs on the same cleaned
-               text. Temperature is set to 0 for deterministic results.
+               (c) Risk vector extractor: fill the eight interpretive risk
+                   dimensions that deterministic rule-based tools cannot handle
+                   (counterparty leverage, termination risk, data sensitivity,
+                   IP ownership risk, payment risk, auto-renewal risk,
+                   confidentiality scope, liability cap adequacy).
+  4. QUERY   – For each AI model, all three prompts are sent sequentially
+               (chained): call (a) completes first, then call (b), then call (c),
+               each on the same cleaned text. Temperature is set to 0 for
+               deterministic results.
   5. PARSE   – Each response is validated against its own Pydantic model.
                Malformed or partial responses surface as errors rather than
                silently producing wrong data.
@@ -85,14 +91,19 @@ OUTPUT FORMAT (one record per model queried)
     "sector_error":            null
   }
 
-  The pipeline makes two sequential AI calls per model per contract:
-    1. Contract type classifier   -> fills all fields except regulated_sectors.
+  The pipeline makes three sequential AI calls per model per contract:
+    1. Contract type classifier   -> fills all fields except regulated_sectors
+                                     and risk_vector_*.
     2. Regulated sector classifier -> fills regulated_sectors using the EU
        NIS2 / DORA / CER / AI Act framework.
+    3. Risk vector extractor      -> fills eight interpretive risk dimensions
+       that deterministic extraction cannot handle (counterparty_leverage,
+       termination_risk, data_sensitivity, ip_ownership_risk, payment_risk,
+       auto_renewal_risk, confidentiality_scope, liability_cap_adequacy).
 
-  If either call fails, its fields are null/[] and the corresponding error
-  key ("error" or "sector_error") explains what went wrong. A sector failure
-  does not suppress the type classification result, and vice versa.
+  If any call fails, its fields are null/[] and the corresponding error
+  key explains what went wrong. A failure in one call does not suppress
+  the results of the others.
 """
 
 import os
@@ -518,6 +529,139 @@ class SectorClassification(BaseModel):
         return cleaned
 
 
+
+# ── Risk vector Pydantic model ────────────────────────────────────────────────
+
+# Canonical labels for categorical risk-vector fields.
+# Using frozensets here mirrors the VALID_SECTORS pattern so validation is
+# consistent and the allowed values are a single source of truth.
+_LEVERAGE_LABELS: frozenset = frozenset({"SUPPLIER", "CUSTOMER", "BALANCED", "UNCLEAR"})
+_OWNERSHIP_LABELS: frozenset = frozenset({"SUPPLIER", "CUSTOMER", "JOINT", "UNCLEAR"})
+_SCOPE_LABELS: frozenset = frozenset({"UNILATERAL_SUPPLIER", "UNILATERAL_CUSTOMER", "MUTUAL", "NONE", "UNCLEAR"})
+
+
+class RiskVectorExtraction(BaseModel):
+    """
+    The structured output of the risk-vector extractor (call 3).
+
+    This model captures eight interpretive dimensions that deterministic
+    rule-based tools (universal_claims, temporal_parser) cannot reliably
+    extract because they require holistic reading of multiple clauses and
+    legal judgment about context.  Each dimension is validated tightly to
+    prevent hallucinated values from reaching downstream consumers.
+
+    The eight dimensions are designed to be orthogonal — each captures a
+    distinct risk axis — and together they form the "interpretive layer" of
+    the full risk vector.  The remaining dimensions (liability cap amount,
+    warranty period, temporal obligations, etc.) are filled deterministically
+    by universal_claims and temporal_parser without LLM involvement.
+
+    Fields
+    ------
+    counterparty_leverage : Which party holds the stronger negotiating position
+        based on the asymmetry of obligations and protections in the contract?
+        Assessed holistically across all clauses, not just one.
+        Allowed values: "SUPPLIER" | "CUSTOMER" | "BALANCED" | "UNCLEAR"
+
+    termination_risk : How exposed is the weaker party to sudden or unilateral
+        termination?  Score 1 (very low) to 5 (very high).
+
+    data_sensitivity : What is the sensitivity level of personal or confidential
+        data exchanged or processed under this contract?
+        Score 1 (no personal data) to 5 (special-category GDPR Art. 9 data).
+
+    ip_ownership_risk : Who owns IP created in the course of performing this
+        contract (work product, deliverables, inventions)?
+        Allowed values: "SUPPLIER" | "CUSTOMER" | "JOINT" | "UNCLEAR"
+
+    payment_risk : How exposed is the supplying party to non-payment or delayed
+        payment?  Score 1 (very low) to 5 (very high).
+
+    auto_renewal_risk : How difficult is it to prevent automatic renewal?
+        Score 1 (no auto-renewal) to 5 (very short opt-out window or multi-year
+        lock-in on renewal).
+
+    confidentiality_scope : Structure of the confidentiality obligation.
+        Allowed values: "MUTUAL" | "UNILATERAL_SUPPLIER" | "UNILATERAL_CUSTOMER"
+        | "NONE" | "UNCLEAR"
+
+    liability_cap_adequacy : Is the liability cap commercially adequate relative
+        to the value and risk profile of the contract?
+        Score 1 (no cap — unlimited exposure) to 5 (cap clearly adequate and
+        proportionate, mutual, with standard carve-outs).
+
+    Validation rules enforced automatically
+    ----------------------------------------
+    - Integer score fields are clamped to [1, 5].  Out-of-range values are
+      clipped rather than rejected — an off-by-one is less harmful than a null.
+    - Categorical string fields are uppercased and checked against their
+      allowed label set.  Unknown values are coerced to "UNCLEAR" rather than
+      raising an error.
+    - null / missing score fields default to 3 (neutral midpoint).
+    - null / missing categorical fields default to "UNCLEAR".
+    - auto_renewal_risk defaults to 1 (not 3) because the absence of an
+      auto-renewal clause is a concrete fact, not an unknown.
+    """
+
+    counterparty_leverage: Annotated[
+        str,
+        BeforeValidator(lambda v: "UNCLEAR" if v is None else str(v).strip().upper()),
+    ] = "UNCLEAR"
+
+    termination_risk: Annotated[
+        int,
+        BeforeValidator(lambda v: 3 if v is None else max(1, min(5, int(v)))),
+    ] = 3
+
+    data_sensitivity: Annotated[
+        int,
+        BeforeValidator(lambda v: 3 if v is None else max(1, min(5, int(v)))),
+    ] = 3
+
+    ip_ownership_risk: Annotated[
+        str,
+        BeforeValidator(lambda v: "UNCLEAR" if v is None else str(v).strip().upper()),
+    ] = "UNCLEAR"
+
+    payment_risk: Annotated[
+        int,
+        BeforeValidator(lambda v: 3 if v is None else max(1, min(5, int(v)))),
+    ] = 3
+
+    auto_renewal_risk: Annotated[
+        int,
+        BeforeValidator(lambda v: 1 if v is None else max(1, min(5, int(v)))),
+    ] = 1
+
+    confidentiality_scope: Annotated[
+        str,
+        BeforeValidator(lambda v: "UNCLEAR" if v is None else str(v).strip().upper()),
+    ] = "UNCLEAR"
+
+    liability_cap_adequacy: Annotated[
+        int,
+        BeforeValidator(lambda v: 3 if v is None else max(1, min(5, int(v)))),
+    ] = 3
+
+    @field_validator("counterparty_leverage")
+    @classmethod
+    def validate_leverage(cls, v: str) -> str:
+        """Coerce unrecognised leverage labels to UNCLEAR rather than rejecting."""
+        return v if v in _LEVERAGE_LABELS else "UNCLEAR"
+
+    @field_validator("ip_ownership_risk")
+    @classmethod
+    def validate_ip_ownership(cls, v: str) -> str:
+        """Coerce unrecognised IP-ownership labels to UNCLEAR rather than rejecting."""
+        return v if v in _OWNERSHIP_LABELS else "UNCLEAR"
+
+    @field_validator("confidentiality_scope")
+    @classmethod
+    def validate_confidentiality_scope(cls, v: str) -> str:
+        """Coerce unrecognised scope labels to UNCLEAR rather than rejecting."""
+        return v if v in _SCOPE_LABELS else "UNCLEAR"
+
+
 def build_sector_prompt() -> str:
     """
     Build the system prompt for the regulated-sector classifier.
@@ -671,6 +815,277 @@ EXAMPLE OUTPUT (AI recruitment tool for a hospital):
   "regulated_sectors": ["Health & Life Sciences", "High-Risk AI"]
 }}
 """
+
+
+
+def build_risk_vector_prompt() -> str:
+    """
+    Build the system prompt for the risk-vector extractor (call 3).
+
+    This prompt asks the model to fill eight interpretive risk dimensions that
+    deterministic rule-based tools cannot handle.  Every dimension has a
+    bounded output type (integer 1-5 or a fixed categorical label) and worked
+    examples calibrated to real contract patterns.
+
+    Design principles
+    -----------------
+    - Bounded outputs only: integer scores and named categorical labels.
+      Open-ended text is not used because it cannot be validated or compared.
+    - Calibrated anchors: each score field includes explicit descriptions of
+      what 1 and 5 mean so the model applies a consistent scale.
+    - Null handling: the model is instructed to use specific sentinel values
+      (null for categorical, 3 for scores) when a dimension cannot be assessed.
+    - Independence from calls 1 and 2: this prompt stands alone; the risk
+      vector is derived purely from the contract text, not from the earlier
+      classifier outputs.
+    """
+    return """You are an expert legal risk analyst specialising in commercial contract review. Your task is to assess eight interpretive risk dimensions of the provided contract and return them as a structured JSON object.
+
+These dimensions require legal judgment and holistic reading of the contract — they cannot be extracted mechanically from individual clauses.
+
+RISK DIMENSIONS
+
+1. counterparty_leverage
+   Which party holds the stronger negotiating position, inferred from the asymmetry of obligations, protections, liability exposure, and termination rights across the whole contract?
+   Allowed values (UPPERCASE, copy exactly):
+     "SUPPLIER"  — the supplier/service provider/licensor bears disproportionately more obligations and risk
+     "CUSTOMER"  — the customer/buyer/licensee holds most of the protective rights and limited obligations
+     "BALANCED"  — obligations and protections are roughly symmetric between both parties
+     "UNCLEAR"   — the contract is too short, too generic, or too ambiguous to assess
+
+2. termination_risk
+   How exposed is the weaker party to sudden or unilateral termination?
+   Integer 1-5:
+     1 = Very low: long bilateral notice (>=90 days), cure period, mutual specific triggers
+     3 = Moderate: 30-60 days notice, some cure period, termination for convenience present but balanced
+     5 = Very high: termination for convenience <=7 days notice, no cure, broad unilateral triggers
+   Use 3 if no termination clause exists.
+
+3. data_sensitivity
+   What is the sensitivity level of personal or confidential data exchanged or processed under this contract?
+   Integer 1-5:
+     1 = No personal data; only B2B operational data
+     2 = Basic contact/business data (name, email, role)
+     3 = Standard personal data (profiles, usage data)
+     4 = Sensitive personal data (financial accounts, HR/employment records, location)
+     5 = Special-category data under GDPR Art. 9 (health, biometrics, race/ethnicity, criminal records)
+   Use 1 if no data processing clause and no personal data signals.
+
+4. ip_ownership_risk
+   Who owns IP created in the course of performing this contract (deliverables, work product, inventions)?
+   Allowed values (UPPERCASE, copy exactly):
+     "SUPPLIER"  — supplier retains ownership; customer receives a licence only
+     "CUSTOMER"  — IP is assigned to the customer (work-for-hire or explicit assignment clause)
+     "JOINT"     — shared or joint ownership of newly created IP
+     "UNCLEAR"   — no IP ownership clause, or clause is ambiguous
+
+5. payment_risk
+   How exposed is the supplying party to non-payment or delayed payment?
+   Integer 1-5:
+     1 = Very low: clear milestones, <=15-day terms, automatic late-payment interest, right to suspend
+     3 = Moderate: standard 30-day terms, late-payment interest present, no suspension right
+     5 = Very high: vague payment triggers, >=60-day terms, no late-payment remedy, no suspension right
+   Use 3 if no payment clause exists (e.g. a standalone NDA).
+
+6. auto_renewal_risk
+   How difficult is it to prevent the contract from automatically renewing?
+   Integer 1-5:
+     1 = No auto-renewal clause at all
+     2 = Auto-renewal present; opt-out window >=90 days
+     3 = Auto-renewal; opt-out window 30-89 days
+     4 = Auto-renewal; opt-out window <30 days
+     5 = Very short or unclear opt-out window, multi-year lock-in on renewal, or no opt-out right
+   Use 1 if no auto-renewal clause exists.
+
+7. confidentiality_scope
+   What is the structure of the confidentiality obligation?
+   Allowed values (UPPERCASE, copy exactly):
+     "MUTUAL"                — both parties bound by symmetric confidentiality obligations
+     "UNILATERAL_SUPPLIER"   — only the supplier must keep the customer's information confidential
+     "UNILATERAL_CUSTOMER"   — only the customer must keep the supplier's information confidential
+     "NONE"                  — no confidentiality clause present
+     "UNCLEAR"               — a confidentiality clause exists but its scope is ambiguous
+
+8. liability_cap_adequacy
+   Is the liability cap commercially adequate and proportionate to the value and risk of this contract?
+   Integer 1-5:
+     1 = No cap: unlimited exposure for at least one party
+     2 = Cap present but very low relative to contract value (e.g. 1x one month's fees)
+     3 = Cap roughly proportionate (e.g. 12x monthly fees or total contract value)
+     4 = Cap generous (well above likely loss scenario, multiple carve-outs)
+     5 = Cap clearly adequate and balanced: proportionate ceiling, mutual, standard carve-outs
+   Use 3 if no cap exists and contract value is unclear.
+
+RULES:
+- Respond ONLY with a valid JSON object. No preamble or markdown.
+- Use null for categorical fields when a clause is absent or too ambiguous to classify.
+- Use integer 3 for score fields when the relevant clause is absent or the contract is too short.
+- Use integers only for score fields — do not return strings like "3" in quotes.
+- Do NOT invent new categorical labels. Use ONLY the values listed above.
+
+EXAMPLE OUTPUT (SaaS agreement, customer-favourable):
+{{
+  "counterparty_leverage": "CUSTOMER",
+  "termination_risk": 3,
+  "data_sensitivity": 3,
+  "ip_ownership_risk": "CUSTOMER",
+  "payment_risk": 2,
+  "auto_renewal_risk": 1,
+  "confidentiality_scope": "MUTUAL",
+  "liability_cap_adequacy": 3
+}}
+
+EXAMPLE OUTPUT (employment contract):
+{{
+  "counterparty_leverage": "CUSTOMER",
+  "termination_risk": 2,
+  "data_sensitivity": 4,
+  "ip_ownership_risk": "CUSTOMER",
+  "payment_risk": 1,
+  "auto_renewal_risk": 1,
+  "confidentiality_scope": "UNILATERAL_SUPPLIER",
+  "liability_cap_adequacy": 1
+}}
+
+EXAMPLE OUTPUT (standalone NDA, no payment terms):
+{{
+  "counterparty_leverage": "BALANCED",
+  "termination_risk": 2,
+  "data_sensitivity": 3,
+  "ip_ownership_risk": "UNCLEAR",
+  "payment_risk": 3,
+  "auto_renewal_risk": 1,
+  "confidentiality_scope": "MUTUAL",
+  "liability_cap_adequacy": 3
+}}
+"""
+
+
+def call_openrouter_risk_vector(
+    model: str,
+    risk_vector_system_prompt: str,
+    user_prompt: str,
+    timeout: int = 60,
+) -> dict:
+    """
+    Send a risk-vector extraction request to a single AI model and return a
+    validated result dictionary.
+
+    Structurally mirrors call_openrouter_sector() but validates against
+    RiskVectorExtraction.  Keeping the three call functions separate ensures
+    a failure in any one never suppresses the results of the other two.
+
+    max_tokens is set to 200 — sufficient for all eight fields with their
+    values, with headroom for any extra whitespace the model may emit.
+
+    Args
+    ----
+    model                    : OpenRouter model ID.
+    risk_vector_system_prompt: Instructions built by build_risk_vector_prompt().
+    user_prompt              : The same contract text wrapped by build_user_prompt(),
+                               reused from the earlier two calls.
+    timeout                  : Maximum seconds to wait (default: 60).
+
+    Returns
+    -------
+    A dict with keys:
+      risk_vector_counterparty_leverage
+      risk_vector_termination_risk
+      risk_vector_data_sensitivity
+      risk_vector_ip_ownership_risk
+      risk_vector_payment_risk
+      risk_vector_auto_renewal_risk
+      risk_vector_confidentiality_scope
+      risk_vector_liability_cap_adequacy
+      risk_vector_raw_response
+      elapsed_risk_vector_s
+      risk_vector_error
+
+    All risk_vector_* keys are prefixed to avoid collisions with the flat
+    output dict merged in classify_contract().
+    """
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "Referer": "https://github.com/contract-classifier",
+        "X-Title": "Contract Classifier",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": risk_vector_system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 200,
+        "response_format": {"type": "json_object"},
+    }
+
+    # Sentinel values used when the call fails — mirrors the pattern used by
+    # call_openrouter_sector for sector failures.
+    _null_risk_vector = {
+        "risk_vector_counterparty_leverage": None,
+        "risk_vector_termination_risk": None,
+        "risk_vector_data_sensitivity": None,
+        "risk_vector_ip_ownership_risk": None,
+        "risk_vector_payment_risk": None,
+        "risk_vector_auto_renewal_risk": None,
+        "risk_vector_confidentiality_scope": None,
+        "risk_vector_liability_cap_adequacy": None,
+        "risk_vector_raw_response": None,
+    }
+
+    t0 = time.perf_counter()
+    raw_content = None  # ensure it exists in exception scope
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(OPENROUTER_API_URL, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+        content = data["choices"][0]["message"]["content"]
+        if content is None:
+            raise ValueError(
+                "Model returned null content (possible content filter or empty response)"
+            )
+        raw_content = _extract_json(content)
+
+        parsed_json = json.loads(raw_content)
+        result = RiskVectorExtraction(**parsed_json)
+
+        return {
+            "risk_vector_counterparty_leverage": result.counterparty_leverage,
+            "risk_vector_termination_risk": result.termination_risk,
+            "risk_vector_data_sensitivity": result.data_sensitivity,
+            "risk_vector_ip_ownership_risk": result.ip_ownership_risk,
+            "risk_vector_payment_risk": result.payment_risk,
+            "risk_vector_auto_renewal_risk": result.auto_renewal_risk,
+            "risk_vector_confidentiality_scope": result.confidentiality_scope,
+            "risk_vector_liability_cap_adequacy": result.liability_cap_adequacy,
+            "risk_vector_raw_response": raw_content,
+            "elapsed_risk_vector_s": round(time.perf_counter() - t0, 2),
+            "risk_vector_error": None,
+        }
+
+    except httpx.HTTPStatusError as e:
+        return {
+            **_null_risk_vector,
+            "elapsed_risk_vector_s": round(time.perf_counter() - t0, 2),
+            "risk_vector_error": f"HTTP {e.response.status_code}: {e.response.text}",
+        }
+    except json.JSONDecodeError as e:
+        return {
+            **_null_risk_vector,
+            "risk_vector_raw_response": raw_content,
+            "elapsed_risk_vector_s": round(time.perf_counter() - t0, 2),
+            "risk_vector_error": f"JSON parse error: {e}",
+        }
+    except Exception as e:
+        return {
+            **_null_risk_vector,
+            "elapsed_risk_vector_s": round(time.perf_counter() - t0, 2),
+            "risk_vector_error": str(e),
+        }
 
 
 def _extract_json(text: str) -> str:
@@ -965,27 +1380,29 @@ def classify_contract(
     Classify a single contract file using one or more AI models and return all results.
 
     Orchestrates the full chained pipeline for each model:
-      1. Load and clean the contract text (once, shared across both calls).
+      1. Load and clean the contract text (once, shared across all three calls).
       2. Run the contract type classifier  (call 1).
       3. Run the regulated sector classifier on the same text (call 2).
-      4. Merge both results into one flat record.
+      4. Run the risk-vector extractor on the same text (call 3).
+      5. Merge all three results into one flat record.
 
-    A failure in either call is recorded in its own error key and does not
-    suppress the other call's results.
+    A failure in any call is recorded in its own error key and does not
+    suppress the other calls' results.
 
     Args
     ────
     contract_file        : Path to the contract text file (.txt or .md from OCS).
     models               : List of OpenRouter model IDs to query. Defaults to MODELS.
     delay_between_calls  : Seconds to pause between successive API calls. Applied
-                           both between the two calls per model and between models.
-                           Increase if you encounter rate-limit errors (default: 1.0).
+                           between each of the three calls per model and between
+                           models. Increase if you encounter rate-limit errors
+                           (default: 1.0).
 
     Returns
     ───────
     A list of merged result dictionaries, one per model queried. Each dict contains
-    all type fields, all sector fields, and both error keys. Failed calls appear
-    with null/[] fields rather than being silently dropped.
+    all type fields, all sector fields, all risk-vector fields, and all three error
+    keys. Failed calls appear with null/[] fields rather than being silently dropped.
     """
     contract_text = load_contract_text(contract_file)
     selected_models = models or MODELS
@@ -996,6 +1413,7 @@ def classify_contract(
 
     type_system_prompt = build_system_prompt()
     sector_system_prompt = build_sector_prompt()
+    risk_vector_system_prompt = build_risk_vector_prompt()
     user_prompt = build_user_prompt(contract_text)
 
     # Derive contract_id from filename (replace dashes with underscores, remove extension)
@@ -1028,7 +1446,7 @@ def classify_contract(
                 f"({type_result.get('elapsed_type_s', '?')}s)"
             )
 
-        # Respect rate limits between the two calls for this model
+        # Respect rate limits between calls for this model
         time.sleep(delay_between_calls)
 
         # ── Call 2: regulated sector classification ─────────────────────────
@@ -1048,18 +1466,62 @@ def classify_contract(
                 f"✅ {sector_result.get('regulated_sectors')} ({sector_result.get('elapsed_sector_s', '?')}s)"
             )
 
-        # ── Merge both results into one flat record ────────────────────────
+        time.sleep(delay_between_calls)
+
+        # ── Call 3: risk vector extraction ──────────────────────────────────
+        print(
+            f"[{i}/{len(selected_models)}] {model} — risk vector ...",
+            end=" ",
+            flush=True,
+        )
+        risk_result = call_openrouter_risk_vector(
+            model, risk_vector_system_prompt, user_prompt
+        )
+
+        if risk_result["risk_vector_error"]:
+            print(
+                f"❌ RISK VECTOR ERROR: {risk_result['risk_vector_error']} "
+                f"({risk_result.get('elapsed_risk_vector_s', '?')}s)"
+            )
+        else:
+            print(
+                f"✅ leverage={risk_result.get('risk_vector_counterparty_leverage')} | "
+                f"term={risk_result.get('risk_vector_termination_risk')} | "
+                f"data={risk_result.get('risk_vector_data_sensitivity')} | "
+                f"ip={risk_result.get('risk_vector_ip_ownership_risk')} | "
+                f"pay={risk_result.get('risk_vector_payment_risk')} | "
+                f"renew={risk_result.get('risk_vector_auto_renewal_risk')} | "
+                f"conf={risk_result.get('risk_vector_confidentiality_scope')} | "
+                f"cap={risk_result.get('risk_vector_liability_cap_adequacy')} "
+                f"({risk_result.get('elapsed_risk_vector_s', '?')}s)"
+            )
+
+        # ── Merge all three results into one flat record ─────────────────────
         merged = {
             **type_result,
             "regulated_sectors": sector_result["regulated_sectors"],
             "sector_raw_response": sector_result["sector_raw_response"],
             "elapsed_sector_s": sector_result["elapsed_sector_s"],
+            "sector_error": sector_result["sector_error"],
+            # Risk vector fields — prefixed to avoid collisions
+            "risk_vector_counterparty_leverage": risk_result["risk_vector_counterparty_leverage"],
+            "risk_vector_termination_risk": risk_result["risk_vector_termination_risk"],
+            "risk_vector_data_sensitivity": risk_result["risk_vector_data_sensitivity"],
+            "risk_vector_ip_ownership_risk": risk_result["risk_vector_ip_ownership_risk"],
+            "risk_vector_payment_risk": risk_result["risk_vector_payment_risk"],
+            "risk_vector_auto_renewal_risk": risk_result["risk_vector_auto_renewal_risk"],
+            "risk_vector_confidentiality_scope": risk_result["risk_vector_confidentiality_scope"],
+            "risk_vector_liability_cap_adequacy": risk_result["risk_vector_liability_cap_adequacy"],
+            "risk_vector_raw_response": risk_result["risk_vector_raw_response"],
+            "elapsed_risk_vector_s": risk_result["elapsed_risk_vector_s"],
+            "risk_vector_error": risk_result["risk_vector_error"],
+            # Total elapsed is the sum of all three calls
             "elapsed_total_s": round(
                 (type_result.get("elapsed_type_s") or 0.0)
-                + (sector_result.get("elapsed_sector_s") or 0.0),
+                + (sector_result.get("elapsed_sector_s") or 0.0)
+                + (risk_result.get("elapsed_risk_vector_s") or 0.0),
                 2,
             ),
-            "sector_error": sector_result["sector_error"],
             "contract_id": contract_id,
         }
         results.append(merged)
